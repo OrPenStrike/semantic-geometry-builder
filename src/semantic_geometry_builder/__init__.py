@@ -1,6 +1,13 @@
 """Public import surface for Semantic Geometry Builder."""
 
-from semantic_geometry_builder.ir import (
+from semantic_geometry_builder.adapter import (
+    build_gdsfactory_geometry_input,
+    build_klayout_tech_geometry_input,
+    build_kqcircuits_geometry_input,
+)
+from semantic_geometry_builder.models import (
+    RUN_METADATA_DIR,
+    SEMANTIC_GEOMETRY_METADATA_DIR,
     AtomicVolumeRecord,
     BBox3D,
     Coordinate,
@@ -13,6 +20,7 @@ from semantic_geometry_builder.ir import (
     InterfaceKindLiteral,
     InterfacePatchRecord,
     LayoutPolygonSpec,
+    PathInput,
     PolygonRing,
     PrimitiveEntityRecord,
     RingPatchRecord,
@@ -20,10 +28,22 @@ from semantic_geometry_builder.ir import (
     RouteMaterializationRecord,
     RoutePolicyRecord,
     SemanticEntitySpec,
-    SemanticGeometryBuilder,
     SheetImprintOperationRecord,
     SolverUseLiteral,
     Vector3D,
+)
+from semantic_geometry_builder.pipeline import (
+    SemanticGeometryBuilder,
+    build_interface_registry,
+    build_semantic_primitives,
+    export_physical_group_records,
+    final_boolean_topology_build,
+    materialize_route,
+    normalize_primitives,
+    plan_inset_rings,
+    reference_boolean_topology_build,
+    resolve_semantic_ownership,
+    validate_geometry_input,
 )
 
 __all__ = [
@@ -39,15 +59,31 @@ __all__ = [
     "InterfaceKindLiteral",
     "InterfacePatchRecord",
     "LayoutPolygonSpec",
+    "PathInput",
     "PolygonRing",
     "PrimitiveEntityRecord",
+    "RUN_METADATA_DIR",
     "RingPatchRecord",
     "RouteLiteral",
     "RouteMaterializationRecord",
+    "SEMANTIC_GEOMETRY_METADATA_DIR",
     "RoutePolicyRecord",
     "SemanticEntitySpec",
     "SemanticGeometryBuilder",
     "SheetImprintOperationRecord",
     "SolverUseLiteral",
     "Vector3D",
+    "build_gdsfactory_geometry_input",
+    "build_interface_registry",
+    "build_kqcircuits_geometry_input",
+    "build_klayout_tech_geometry_input",
+    "build_semantic_primitives",
+    "export_physical_group_records",
+    "final_boolean_topology_build",
+    "materialize_route",
+    "normalize_primitives",
+    "plan_inset_rings",
+    "reference_boolean_topology_build",
+    "resolve_semantic_ownership",
+    "validate_geometry_input",
 ]
