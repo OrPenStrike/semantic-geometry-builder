@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import get_args
 
 from semantic_geometry_builder.models import (
     AtomicVolumeRecord,
+    ConductorRepresentationLiteral,
     FinalPhysicalGroupRecord,
     FinalTopologyRecord,
     GeometryBuildInput,
@@ -119,8 +121,93 @@ def validate_geometry_input(build_input: GeometryBuildInput) -> GeometryBuildInp
     that deck route representations follow the attached face-metal
     representations unless metadata documents an explicit override.
     """
-    del build_input
-    raise NotImplementedError("validate_geometry_input")
+    errors: list[str] = []
+    polygon_ids: set[str] = set()
+    entities_by_id: dict[str, SemanticEntitySpec] = {}
+
+    for polygon in build_input.polygons:
+        if not polygon.polygon_id:
+            errors.append("polygon_id must be non-empty")
+        elif polygon.polygon_id in polygon_ids:
+            errors.append(f"duplicate polygon_id: {polygon.polygon_id}")
+        polygon_ids.add(polygon.polygon_id)
+
+    for entity in build_input.entities:
+        if not entity.semantic_id:
+            errors.append("semantic_id must be non-empty")
+        elif entity.semantic_id in entities_by_id:
+            errors.append(f"duplicate semantic_id: {entity.semantic_id}")
+        entities_by_id[entity.semantic_id] = entity
+
+        for polygon_id in entity.polygon_ids:
+            if polygon_id not in polygon_ids:
+                errors.append(
+                    f"{entity.semantic_id} references unknown polygon_id: {polygon_id}"
+                )
+
+    solution_tokens = ("solution", "air", "substrate", "dielectric", "domain")
+    solution_entity_ids = {
+        entity.semantic_id
+        for entity in build_input.entities
+        if any(
+            token in f"{entity.role} {entity.geometry_kind}".lower()
+            for token in solution_tokens
+        )
+    }
+    for semantic_id in build_input.solution_regions:
+        if semantic_id not in solution_entity_ids:
+            errors.append(
+                f"solution_regions key must reference a solution-domain entity: "
+                f"{semantic_id}"
+            )
+
+    valid_routes = set(get_args(RouteLiteral))
+    valid_representations = set(get_args(ConductorRepresentationLiteral))
+    for entity in build_input.entities:
+        for route, representation in entity.route_representations.items():
+            if route not in valid_routes:
+                errors.append(f"{entity.semantic_id} has unsupported route: {route}")
+            if representation not in valid_representations:
+                errors.append(
+                    f"{entity.semantic_id} has unsupported representation for "
+                    f"{route}: {representation}"
+                )
+
+    for entity in build_input.entities:
+        if entity.part_role != "airbridge_deck":
+            continue
+
+        target_id = entity.attached_face_metal_semantic_id
+        if not target_id:
+            errors.append(
+                f"{entity.semantic_id} airbridge_deck requires "
+                "attached_face_metal_semantic_id"
+            )
+            continue
+
+        target = entities_by_id.get(target_id)
+        if target is None:
+            errors.append(
+                f"{entity.semantic_id} attaches to unknown face metal: {target_id}"
+            )
+            continue
+        if target.part_role != "face_metal":
+            errors.append(
+                f"{entity.semantic_id} attaches to non-face-metal entity: {target_id}"
+            )
+        if (
+            not entity.metadata.get("route_inheritance_override_reason")
+            and dict(entity.route_representations) != dict(target.route_representations)
+        ):
+            errors.append(
+                f"{entity.semantic_id} route_representations must follow "
+                f"attached face metal {target_id}"
+            )
+
+    if errors:
+        raise ValueError("Invalid GeometryBuildInput: " + "; ".join(errors))
+
+    return build_input
 
 
 def build_semantic_primitives(
