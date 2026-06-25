@@ -1,5 +1,0 @@
-UNITS um
-/ layer			  destinatioin		    color		     elevation		      thickness
-201			  D0_Substrate		    black		     -500.0		      500
-1			  D0_TOP_M1		    orange		     0.0		      0.2
-110			  D0_TOP_GROUND_MASK	    green		     0.0		      0.0
