@@ -1,14 +1,20 @@
 """Semantic geometry contracts for route-aware bottom-up construction.
 
-The v1 direction is surface-plan and tag-plan first:
+The v1 direction is topology-plan and tag-plan first:
 
-`GeometryBuildInput -> InterfacePlan -> SurfacePartition -> SurfacePlan
+`GeometryBuildInput -> 2D normalization -> planar arrangement -> stack
+z-sweep/material occupancy -> InterfacePlan -> SurfacePartition/surface
+candidates -> PointPlan -> CurvePlan -> SurfaceLoop -> canonical SurfacePlan
 -> VolumePlan / ConstructionBodyPlan -> CutHostOperationPlan -> TagPlan`.
 
 Backends must build every planned surface before they build any backend-live
 volume. A volume is valid only after all of its boundary faces are represented
-by `SurfacePlanRecord`s and referenced by `SurfaceRefRecord`s. The OCC lowering
-contract is therefore:
+by `SurfacePlanRecord`s and referenced by `SurfaceRefRecord`s.
+
+Topology-first canonical identity is part of the compiler contract. Shared
+vertices, edges, and face patches must be planned as shared records before
+backend lowering; a backend point/line cache is only an implementation detail,
+not proof of conformal geometry. The OCC lowering contract is therefore:
 
 `addPoint() -> addLine() -> addCurveLoop() -> addPlaneSurface()` for controlled
 surfaces, then `addSurfaceLoop() -> addVolume()` for volumes.
@@ -16,6 +22,10 @@ surfaces, then `addSurfaceLoop() -> addVolume()` for volumes.
 Direct volume creation from boxes, extrusions, or unplanned bounds is not a v1
 production path because it hides boundary surfaces from the semantic tag plan.
 Global OCC fragment is not the semantic discovery mechanism.
+
+Plan ids are the source of truth. Backend tags and physical-group ids are
+lowering results mapped back to these records; the backend must not invent
+semantic identity.
 """
 
 from __future__ import annotations
@@ -66,6 +76,9 @@ SurfaceParameterizationKindLiteral = Literal[
     "occ_native_parametric",
 ]
 SurfacePartitionApplicationModeLiteral = Literal["replace_parent_with_children"]
+CurveKindLiteral = Literal["line_segment"]
+CurveOrientationLiteral = Literal[1, -1]
+SurfaceLoopRoleLiteral = Literal["outer", "hole"]
 TagSourceKindLiteral = Literal["surface", "volume"]
 SolverUseLiteral = Literal["solver_active"]
 DEFAULT_INTERFACE_SOLVER_USE: dict[InterfaceKindLiteral, SolverUseLiteral] = {
@@ -183,12 +196,12 @@ class SurfacePlanRecord:
     backend lowering. The backend must create each child surface directly from
     its loops and hole loops; it must not cut a parent surface later.
 
-    `geometry_ref` is the backend handoff for direct surface creation. It should
-    carry `plane` or `contact_plane`, `outer_loop`, optional `hole_loops`,
-    optional `footprint`, optional `inset_band`, and optional
-    `loop_geometry_ref`. A surface that cannot provide this information must
-    fail during backend construction rather than falling back to global
-    fragment-based discovery.
+    v1 backend lowering should consume `outer_loop_ref` and `hole_loop_refs`.
+    `geometry_ref` remains as audit/source metadata: it may carry `plane` or
+    `contact_plane`, `outer_loop`, optional `hole_loops`, optional `footprint`,
+    optional `inset_band`, and optional `loop_geometry_ref`. A surface that
+    cannot be tied to canonical loop refs must fail during canonicalization
+    rather than falling back to global fragment-based discovery.
 
     `metadata` may carry side/exposure semantics such as `interface_kinds`,
     `surface_side`, `owner_semantic_ids`, `adjacent_domain_id`,
@@ -203,6 +216,8 @@ class SurfacePlanRecord:
     owner_semantic_id: str
     surface_role: str
     geometry_ref: Mapping[str, Any]
+    outer_loop_ref: str | None = None
+    hole_loop_refs: tuple[str, ...] = ()
     interface_id: str | None = None
     parent_surface_id: str | None = None
     partition_label: str | None = None
@@ -220,6 +235,70 @@ class SurfaceRefRecord:
     surface_id: str
     orientation: SurfaceOrientationLiteral
     role: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PointPlanRecord:
+    """One canonical planned point shared by all touching curves.
+
+    A conformal v1 plan may not contain two live point records at the same
+    coordinate. Points are topology/audit records, not physical groups.
+    """
+
+    point_id: str
+    coordinate: Vector3D
+    owner_semantic_ids: tuple[str, ...] = ()
+    interface_ids: tuple[str, ...] = ()
+    used_by_curve_ids: tuple[str, ...] = ()
+    boundary_volume_ids: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CurvePlanRecord:
+    """One canonical planned curve shared by all touching surfaces.
+
+    Curves are topology/audit/mesh-refinement contract records, not physical
+    groups. `used_by_surface_ids`, `interface_ids`, and `boundary_volume_ids`
+    describe how the curve participates in the final topology without forcing a
+    single semantic owner for shared edges.
+    """
+
+    curve_id: str
+    curve_kind: CurveKindLiteral
+    start_point_id: str
+    end_point_id: str
+    owner_semantic_ids: tuple[str, ...] = ()
+    interface_ids: tuple[str, ...] = ()
+    used_by_surface_ids: tuple[str, ...] = ()
+    boundary_volume_ids: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CurveRefRecord:
+    """Oriented reference to one canonical curve from a surface loop."""
+
+    curve_id: str
+    orientation: CurveOrientationLiteral
+    role: str
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class SurfaceLoopRecord:
+    """Canonical loop used by a planned surface.
+
+    A surface owns one outer loop and zero or more hole loops by reference.
+    The loop owns ordered `CurveRefRecord`s so shared boundaries are explicit
+    before OCC lowering.
+    """
+
+    loop_id: str
+    curve_refs: tuple[CurveRefRecord, ...]
+    role: SurfaceLoopRoleLiteral
+    surface_id: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -291,7 +370,9 @@ class TagPlanRecord:
     Tags are planned before OCC construction. `source_record_kind` and
     `source_record_id` must point to a live `SurfacePlanRecord` or
     `VolumePlanRecord`. After backend construction, the same source id is used
-    to recover OCC dim-tags and create final physical groups.
+    to recover OCC dim-tags and create final physical groups. Together with
+    `BackendEntityTagRecord`, this is the tag ledger: plan ids are stable,
+    OCC tags are lowering results, and physical names are solver-facing labels.
     """
 
     physical_name: str
@@ -313,7 +394,11 @@ class TagPlanRecord:
 
 @dataclass(frozen=True)
 class BackendEntityTagRecord:
-    """Backend dim-tag recovered for one live planned source record."""
+    """Backend dim-tag recovered for one live planned source record.
+
+    Two live source ids mapping to the same backend dim-tag means
+    canonicalization failed earlier; do not accept that as a backend shortcut.
+    """
 
     source_record_kind: TagSourceKindLiteral
     source_record_id: str
@@ -356,7 +441,8 @@ class ConstructionPlanRecord:
 
     This is the complete input to the backend. `interfaces` explain why shared
     surfaces exist, `surface_partitions` explain parent-to-child inset
-    coverage, `surfaces` and `volumes` describe geometry to build,
+    coverage, `points`, `curves`, and `surface_loops` make shared topology
+    canonical, `surfaces` and `volumes` describe geometry to build,
     `construction_bodies` and `cut_operations` describe Route A/B host cuts,
     and `tags` define physical names before backend dim-tags exist.
 
@@ -368,6 +454,9 @@ class ConstructionPlanRecord:
     route: RouteLiteral
     interfaces: tuple[InterfacePlanRecord, ...] = ()
     surface_partitions: tuple[SurfacePartitionRecord, ...] = ()
+    points: tuple[PointPlanRecord, ...] = ()
+    curves: tuple[CurvePlanRecord, ...] = ()
+    surface_loops: tuple[SurfaceLoopRecord, ...] = ()
     surfaces: tuple[SurfacePlanRecord, ...] = ()
     volumes: tuple[VolumePlanRecord, ...] = ()
     construction_bodies: tuple[ConstructionBodyPlanRecord, ...] = ()

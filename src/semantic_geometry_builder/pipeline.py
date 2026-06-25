@@ -35,13 +35,20 @@ from semantic_geometry_builder.planning import (
     recognize_route_interfaces,
 )
 from semantic_geometry_builder.validation import (
+    validate_backend_tag_ledger,
+    validate_curve_plan_coverage,
     validate_geometry_input,
+    validate_interface_surface_source_of_truth,
+    validate_no_surface_overlap,
     validate_route_operation_coverage,
     validate_route_volume_surface_refs,
     validate_selected_route,
+    validate_surface_deduplication,
     validate_surface_partition_coverage,
     validate_surface_sheet_interface_coverage,
+    validate_surface_use_counts,
     validate_tag_plan_coverage,
+    validate_volume_surface_closure,
 )
 
 __all__ = [
@@ -55,13 +62,20 @@ __all__ = [
     "plan_route_volumes",
     "plan_surface_partitions",
     "recognize_route_interfaces",
+    "validate_backend_tag_ledger",
+    "validate_curve_plan_coverage",
     "validate_geometry_input",
+    "validate_interface_surface_source_of_truth",
+    "validate_no_surface_overlap",
     "validate_route_operation_coverage",
     "validate_route_volume_surface_refs",
     "validate_selected_route",
+    "validate_surface_deduplication",
     "validate_surface_partition_coverage",
     "validate_surface_sheet_interface_coverage",
+    "validate_surface_use_counts",
     "validate_tag_plan_coverage",
+    "validate_volume_surface_closure",
 ]
 
 
@@ -113,6 +127,7 @@ class SemanticGeometryBuilder:
         )
         _write_stage_sidecar(metadata_dir, "03_build_occ_geometry", built_plan)
 
+        validate_backend_tag_ledger(backend_tags=built_plan.backend_entity_tags)
         physical_groups = export_physical_group_records(built_plan)
         _write_stage_sidecar(
             metadata_dir,

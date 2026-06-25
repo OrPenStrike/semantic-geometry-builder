@@ -37,8 +37,9 @@ Read the package in this order:
    backend, then exports `FinalPhysicalGroupRecord`s.
 4. Routes: Route A produces interface-owned sheets plus PEC shells; Route B
    produces cutout shells; Route C produces retained material volumes.
-5. Backend: planned loops become Gmsh/OCC points, lines, curve loops, plane
-   surfaces, surface loops, volumes, physical groups, and finally one XAO file.
+5. Backend: planned curves and surface loops become Gmsh/OCC points, lines,
+   curve loops, plane surfaces, surface loops, volumes, physical groups, and
+   finally one XAO file.
 6. Output: one build writes one route XAO file under `geometry/` plus JSON
    sidecars under `metadata/semantic_geometry/`. This package does not write a
    mesh file.
@@ -81,26 +82,47 @@ The v1 backend target is:
 
 ```text
 GeometryBuildInput
-    -> 2D/stack interface intent
-    -> surface partition plan + live surface plan + volume plan + tag plan
+    -> 2D semantic normalization / planar arrangement / stack z-sweep
+    -> InterfacePlan
+    -> surface candidates / partitions
+    -> PointPlan + CurvePlan + SurfaceLoop refs
+    -> canonical SurfacePlan
+    -> VolumePlan
+    -> TagPlan
     -> bottom-up Gmsh/OCC construction
     -> XAO / physical-group export
+    -> topology audit / meshability audit
 ```
 
-Interfaces must be identified before backend geometry is created. Each
-interface kind has its own detection rule: for example, draw-metal to derived
-ground-plane `MM` edges can come from draw and ground-mask cutout polygons
-sharing an edge; Indium bump and airbridge contacts can come from projected
-footprint overlap on the relevant XY plane. Inset rings are also planned here:
-the planner should expand the parent interface into child ring/core
-`SurfacePlanRecord`s before backend construction. The backend receives only live
-child surfaces and builds them directly with explicit curve loops and hole
-loops during `addPlaneSurface()`.
+The stack JSON is not only a height table. It is the material-occupancy input
+that lets the planner sweep normalized 2D cells through z-events and decide
+which material/domain owns each 3D cell. Interfaces must then be identified
+from cell adjacency before backend geometry is created. Horizontal adjacency
+creates top/bottom faces such as `MS`, `MA`, or `SA`; vertical adjacency from
+shared atomic 2D edges creates sidewall faces.
+
+Inset rings are planned before OCC construction: the planner should expand the
+parent interface into child ring/core `SurfacePlanRecord`s, disable the parent
+as live geometry, and only pass non-overlapping children downstream. The
+planner also owns the canonical topology registry: shared vertices, shared
+edges, and shared face patches must become shared `PointPlanRecord`s,
+`CurvePlanRecord`s, and ordered `SurfaceLoopRecord`s before OCC lowering.
+Backend line caches are allowed as a lowering optimization, but they are not
+the source of truth for conformal topology.
 
 `occ.fragment()` is not the interface discovery engine for v1. It may remain a
 local fallback only after the surface/volume plan says a small, specific
 partition is required. It must not be used as a global all-to-all construction
 strategy, and it must not be the mechanism that assigns semantic identity.
+`sewing=True` and `removeAllDuplicates()` are also outside the v1 correctness
+path; they hide missing canonical topology instead of proving it.
+
+Validation is split in two. Pre-lowering validation checks canonical points,
+curves, loops, surfaces, interface coverage, volume closure, surface use
+counts, and tag references without asking Gmsh to repair anything.
+Post-lowering audit checks that OCC boundaries and physical groups match the
+planned ids. Meshability may be checked in memory as an audit gate, but this
+package still does not write `.msh` files.
 
 Current source layers:
 
@@ -113,7 +135,8 @@ Current source layers:
 - `src/semantic_geometry_builder/pipeline.py`: small public facade for
   run-folder orchestration and stable imports.
 - `src/semantic_geometry_builder/planning.py`: route-first interface,
-  surface-partition, construction-body, volume, cut-operation, and tag plans.
+  surface-partition, canonical point/curve/surface-loop, construction-body,
+  volume, cut-operation, and tag plans.
 - `src/semantic_geometry_builder/validation.py`: fail-fast input and plan
   invariants.
 - `src/semantic_geometry_builder/export.py`: backend dim-tag to physical-group
