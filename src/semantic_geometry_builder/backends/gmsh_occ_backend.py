@@ -9,7 +9,7 @@ Expected implementation shape:
 2. create Route A/B construction bodies only for `ConstructionBodyPlanRecord`;
 3. execute `CutHostOperationRecord` plans and recover exposed shell surfaces;
 4. reuse the same surface tag for planned conformal interfaces;
-5. assemble each Route C volume with `occ.addSurfaceLoop()` and
+5. assemble every backend-live volume with `occ.addSurfaceLoop()` and
    `occ.addVolume()`;
 6. recover backend dim-tags by `SurfacePlanRecord.surface_id` and
    `VolumePlanRecord.volume_id`;
@@ -27,12 +27,17 @@ Concrete Gmsh/OCC lowering:
 - For each closed ring, call `gmsh.model.occ.addCurveLoop()`.
 - For each planned surface, call `gmsh.model.occ.addPlaneSurface()` with the
   outer loop and any hole loops in one call.
-- For each retained Route C volume, call `gmsh.model.occ.addSurfaceLoop()` with
-  the planned `SurfaceRefRecord`s, then `gmsh.model.occ.addVolume()`.
+- For each backend-live volume, call `gmsh.model.occ.addSurfaceLoop()` with the
+  planned `SurfaceRefRecord`s, then `gmsh.model.occ.addVolume()`.
 - After `gmsh.model.occ.synchronize()`, recover dim-tags by source record id,
   call `gmsh.model.addPhysicalGroup()` for each `TagPlanRecord`, call
   `gmsh.model.setPhysicalName()` with the planned physical name, and write one
   route XAO file.
+
+Do not create volumes directly with boxes, extrusions, or `geometry_ref`
+fallbacks. `domain_bounds_um` may help the planner create outer boundary
+surfaces, but the backend only accepts volumes whose boundary surfaces already
+exist in the plan.
 
 Ground-plane subtraction should be handled as planned surface geometry in the
 OCC kernel, not by preprocessing GDS into fragmented positive polygons.
@@ -70,6 +75,7 @@ from semantic_geometry_builder.models import (
     BackendEntityTagRecord,
     ConstructionPlanRecord,
     GmshDimTag,
+    TagPlanRecord,
 )
 
 
@@ -80,12 +86,14 @@ def write_occ_geometry_from_plan(
 ) -> ConstructionPlanRecord:
     """Write one XAO and return the plan with backend tags attached.
 
-    The implementation must attach physical groups before writing `xao_path`.
-    It should return a copy of `plan` with `backend_entity_tags` populated so
-    `export_physical_group_records()` can produce the review sidecar.
+    The implementation attaches physical groups before writing `xao_path` and
+    returns a copy of `plan` with `backend_entity_tags` populated. It refuses
+    any volume that lacks planned `surface_refs`, because constructing that
+    volume directly would bypass semantic surface ownership.
     """
     import gmsh
 
+    _validate_conformal_plan(plan)
     xao_path.parent.mkdir(parents=True, exist_ok=True)
     was_initialized = bool(gmsh.isInitialized())
     if not was_initialized:
@@ -96,24 +104,30 @@ def write_occ_geometry_from_plan(
         gmsh.model.add(f"semantic_geometry_route_{plan.route.lower()}")
 
         source_tags: dict[tuple[str, str], list[GmshDimTag]] = {}
-        for volume in plan.volumes:
-            geometry_ref = _geometry_ref(volume.metadata)
-            volume_tag = _add_volume_from_geometry_ref(gmsh, geometry_ref)
-            source_tags.setdefault(("volume", volume.volume_id), []).append(
-                (3, volume_tag)
+        for surface in plan.surfaces:
+            try:
+                surface_tag = _add_surface_from_geometry_ref(
+                    gmsh,
+                    surface.geometry_ref,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to build surface {surface.surface_id}"
+                ) from exc
+            source_tags.setdefault(("surface", surface.surface_id), []).extend(
+                [(2, surface_tag)]
             )
 
-        for surface in plan.surfaces:
-            geometry_ref = surface.geometry_ref
-            if surface.surface_role == "cutout_boundary_shell":
-                surface_tags = _add_shell_from_geometry_ref(gmsh, geometry_ref)
-            else:
-                surface_tags = (
-                    _add_plane_surface_from_geometry_ref(gmsh, geometry_ref),
+        for volume in plan.volumes:
+            surface_tags = _volume_surface_tags(volume, source_tags)
+            if not surface_tags:
+                raise ValueError(
+                    f"{volume.volume_id} requires planned surface_refs before "
+                    "backend volume creation"
                 )
-            source_tags.setdefault(("surface", surface.surface_id), []).extend(
-                (2, surface_tag)
-                for surface_tag in surface_tags
+            volume_tag = _add_volume_from_surface_tags(gmsh, surface_tags)
+            source_tags.setdefault(("volume", volume.volume_id), []).append(
+                (3, volume_tag)
             )
 
         gmsh.model.occ.synchronize()
@@ -128,28 +142,21 @@ def write_occ_geometry_from_plan(
             for dim_tag in dim_tags
         )
 
-        for tag_plan in plan.tags:
-            dim_tags = source_tags.get(
-                (tag_plan.source_record_kind, tag_plan.source_record_id),
-                (),
-            )
-            entity_tags = [
-                entity_tag
-                for dimension, entity_tag in dim_tags
-                if dimension == tag_plan.dimension
-            ]
+        for tag_plans in _group_tag_plans(plan.tags):
+            first_tag = tag_plans[0]
+            entity_tags = _physical_entity_tags(tag_plans, source_tags)
             if not entity_tags:
                 raise ValueError(
-                    f"{tag_plan.physical_name} has no backend entity tags"
+                    f"{first_tag.physical_name} has no backend entity tags"
                 )
             group_tag = gmsh.model.addPhysicalGroup(
-                tag_plan.dimension,
+                first_tag.dimension,
                 entity_tags,
             )
             gmsh.model.setPhysicalName(
-                tag_plan.dimension,
+                first_tag.dimension,
                 group_tag,
-                tag_plan.physical_name,
+                first_tag.physical_name,
             )
 
         gmsh.write(str(xao_path))
@@ -166,45 +173,79 @@ def write_occ_geometry_from_plan(
             gmsh.finalize()
 
 
-def _geometry_ref(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
-    geometry_ref = metadata.get("geometry_ref")
-    if not isinstance(geometry_ref, Mapping):
-        raise ValueError("volume metadata requires geometry_ref")
-    return geometry_ref
-
-
-def _add_volume_from_geometry_ref(gmsh: Any, geometry_ref: Mapping[str, Any]) -> int:
-    if "domain_bounds_um" in geometry_ref:
-        bounds = geometry_ref["domain_bounds_um"]
-        outer_loop = (
-            (float(bounds["x_min_um"]), float(bounds["y_min_um"])),
-            (float(bounds["x_max_um"]), float(bounds["y_min_um"])),
-            (float(bounds["x_max_um"]), float(bounds["y_max_um"])),
-            (float(bounds["x_min_um"]), float(bounds["y_max_um"])),
+def _validate_conformal_plan(plan: ConstructionPlanRecord) -> None:
+    """Reject any backend-live volume that would need direct construction."""
+    unpartitioned_volumes = [
+        volume.volume_id
+        for volume in plan.volumes
+        if not volume.construction_only and not volume.surface_refs
+    ]
+    if unpartitioned_volumes:
+        raise NotImplementedError(
+            "nonconformal OCC build refused: backend-live volumes must be "
+            "assembled from planned surface_refs with addSurfaceLoop/addVolume "
+            f"{unpartitioned_volumes!r}. Building these directly would create "
+            "standalone surfaces instead of shared conformal topology."
         )
-        z_min_um = float(geometry_ref["z_min_um"])
-        z_max_um = float(geometry_ref["z_max_um"])
-        return _add_prism_volume(gmsh, outer_loop, (), z_min_um, z_max_um)
 
-    outer_loop = _outer_loop(geometry_ref)
-    hole_loops = _hole_loops(geometry_ref)
-    z_min_um = float(geometry_ref.get("z_min_um", geometry_ref.get("z_um", 0.0)))
-    thickness_um = float(geometry_ref.get("thickness_um", 0.0))
-    if thickness_um <= 0:
-        raise ValueError("volume geometry_ref requires positive thickness_um")
-    return _add_prism_volume(
-        gmsh,
-        outer_loop,
-        hole_loops,
-        z_min_um,
-        z_min_um + thickness_um,
+
+def _volume_surface_tags(
+    volume: Any,
+    source_tags: Mapping[tuple[str, str], Sequence[GmshDimTag]],
+) -> tuple[int, ...]:
+    return tuple(
+        tag
+        for surface_ref in volume.surface_refs
+        for dim, tag in source_tags.get(("surface", surface_ref.surface_id), ())
+        if dim == 2
     )
 
 
-def _add_plane_surface_from_geometry_ref(
+def _group_tag_plans(
+    tags: tuple[TagPlanRecord, ...],
+) -> tuple[tuple[TagPlanRecord, ...], ...]:
+    grouped: dict[tuple[str, int, str, str], list[TagPlanRecord]] = {}
+    for tag in tags:
+        grouped.setdefault(
+            (tag.physical_name, tag.dimension, tag.role, tag.solver_use),
+            [],
+        ).append(tag)
+    return tuple(tuple(items) for items in grouped.values())
+
+
+def _physical_entity_tags(
+    tag_plans: tuple[TagPlanRecord, ...],
+    source_tags: Mapping[tuple[str, str], Sequence[GmshDimTag]],
+) -> list[int]:
+    entity_tags: list[int] = []
+    seen: set[int] = set()
+    for tag_plan in tag_plans:
+        for dimension, entity_tag in source_tags.get(
+            (tag_plan.source_record_kind, tag_plan.source_record_id),
+            (),
+        ):
+            if dimension != tag_plan.dimension or entity_tag in seen:
+                continue
+            entity_tags.append(entity_tag)
+            seen.add(entity_tag)
+    return entity_tags
+
+
+def _add_volume_from_surface_tags(gmsh: Any, surface_tags: Sequence[int]) -> int:
+    shell_tag = gmsh.model.occ.addSurfaceLoop(list(surface_tags), sewing=True)
+    return gmsh.model.occ.addVolume([shell_tag])
+
+
+def _add_surface_from_geometry_ref(
     gmsh: Any,
     geometry_ref: Mapping[str, Any],
 ) -> int:
+    if "quad_points" in geometry_ref:
+        return _add_quad_points_surface(gmsh, geometry_ref["quad_points"])
+    if geometry_ref.get("shell_part") == "sidewall":
+        raise ValueError("sidewall surfaces must be split into quad_points")
+    if "shell_part" in geometry_ref:
+        return _add_shell_from_geometry_ref(gmsh, geometry_ref)
     z_um = _plane_z_um(geometry_ref)
     return _add_plane_surface(
         gmsh,
@@ -217,96 +258,20 @@ def _add_plane_surface_from_geometry_ref(
 def _add_shell_from_geometry_ref(
     gmsh: Any,
     geometry_ref: Mapping[str, Any],
-) -> tuple[int, ...]:
+) -> int:
     outer_loop = _outer_loop(geometry_ref)
     hole_loops = _hole_loops(geometry_ref)
     z_min_um = float(geometry_ref.get("z_min_um", geometry_ref.get("z_um", 0.0)))
     thickness_um = float(geometry_ref.get("thickness_um", 0.0))
     shell_part = geometry_ref.get("shell_part")
     if thickness_um <= 0:
-        return (_add_plane_surface(gmsh, outer_loop, hole_loops, z_min_um),)
+        return _add_plane_surface(gmsh, outer_loop, hole_loops, z_min_um)
     z_max_um = z_min_um + thickness_um
     if shell_part == "top":
-        return (_add_plane_surface(gmsh, outer_loop, hole_loops, z_max_um),)
+        return _add_plane_surface(gmsh, outer_loop, hole_loops, z_max_um)
     if shell_part == "bottom":
-        return (_add_plane_surface(gmsh, outer_loop, hole_loops, z_min_um),)
-    if shell_part == "sidewall":
-        return tuple(
-            _add_sidewall_surfaces(
-                gmsh,
-                outer_loop,
-                hole_loops,
-                z_min_um,
-                z_max_um,
-            )
-        )
-    return tuple(_add_prism_surfaces(gmsh, outer_loop, hole_loops, z_min_um, z_max_um))
-
-
-def _add_prism_volume(
-    gmsh: Any,
-    outer_loop: Sequence[Sequence[float]],
-    hole_loops: Sequence[Sequence[Sequence[float]]],
-    z_min_um: float,
-    z_max_um: float,
-) -> int:
-    surface_tags = _add_prism_surfaces(
-        gmsh,
-        outer_loop,
-        hole_loops,
-        z_min_um,
-        z_max_um,
-    )
-    shell_tag = gmsh.model.occ.addSurfaceLoop(surface_tags, sewing=True)
-    return gmsh.model.occ.addVolume([shell_tag])
-
-
-def _add_prism_surfaces(
-    gmsh: Any,
-    outer_loop: Sequence[Sequence[float]],
-    hole_loops: Sequence[Sequence[Sequence[float]]],
-    z_min_um: float,
-    z_max_um: float,
-) -> list[int]:
-    rings = [_clean_ring(outer_loop), *[_clean_ring(ring) for ring in hole_loops]]
-    surface_tags = [
-        _add_plane_surface(gmsh, rings[0], rings[1:], z_min_um),
-        _add_plane_surface(gmsh, rings[0], rings[1:], z_max_um),
-    ]
-    for ring in rings:
-        for start, end in _ring_edges(ring):
-            surface_tags.append(
-                _add_quad_surface(
-                    gmsh,
-                    (start[0], start[1], z_min_um),
-                    (end[0], end[1], z_min_um),
-                    (end[0], end[1], z_max_um),
-                    (start[0], start[1], z_max_um),
-                )
-            )
-    return surface_tags
-
-
-def _add_sidewall_surfaces(
-    gmsh: Any,
-    outer_loop: Sequence[Sequence[float]],
-    hole_loops: Sequence[Sequence[Sequence[float]]],
-    z_min_um: float,
-    z_max_um: float,
-) -> list[int]:
-    surface_tags: list[int] = []
-    for ring in (_clean_ring(outer_loop), *[_clean_ring(ring) for ring in hole_loops]):
-        for start, end in _ring_edges(ring):
-            surface_tags.append(
-                _add_quad_surface(
-                    gmsh,
-                    (start[0], start[1], z_min_um),
-                    (end[0], end[1], z_min_um),
-                    (end[0], end[1], z_max_um),
-                    (start[0], start[1], z_max_um),
-                )
-            )
-    return surface_tags
+        return _add_plane_surface(gmsh, outer_loop, hole_loops, z_min_um)
+    raise ValueError(f"unsupported shell_part {shell_part!r}")
 
 
 def _add_plane_surface(
@@ -325,14 +290,16 @@ def _add_plane_surface(
     return gmsh.model.occ.addPlaneSurface(loop_tags)
 
 
-def _add_quad_surface(
+def _add_quad_points_surface(
     gmsh: Any,
-    p0: tuple[float, float, float],
-    p1: tuple[float, float, float],
-    p2: tuple[float, float, float],
-    p3: tuple[float, float, float],
+    points: Sequence[Sequence[float]],
 ) -> int:
-    loop_tag = _add_curve_loop(gmsh, (p0, p1, p2, p3))
+    if len(points) != 4:
+        raise ValueError("quad_points requires exactly 4 points")
+    loop_tag = _add_curve_loop(
+        gmsh,
+        tuple((float(point[0]), float(point[1]), float(point[2])) for point in points),
+    )
     return gmsh.model.occ.addPlaneSurface([loop_tag])
 
 

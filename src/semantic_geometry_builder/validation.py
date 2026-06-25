@@ -87,6 +87,14 @@ def validate_route_operation_coverage(
 ) -> None:
     """Validate Route A/B construction-body, cut, and shell-surface linkage."""
     surface_ids = {surface.surface_id for surface in surfaces}
+    covered_surface_ids = {
+        *surface_ids,
+        *(
+            surface.parent_surface_id
+            for surface in surfaces
+            if surface.parent_surface_id is not None
+        ),
+    }
     body_ids = {body.construction_body_id for body in construction_bodies}
     operation_body_ids = {
         construction_body_id
@@ -104,7 +112,7 @@ def validate_route_operation_coverage(
         missing_surfaces = [
             surface_id
             for surface_id in body.expected_surface_ids
-            if surface_id not in surface_ids
+            if surface_id not in covered_surface_ids
         ]
         if missing_surfaces:
             errors.append(
@@ -118,7 +126,7 @@ def validate_route_operation_coverage(
             f"construction bodies without cut operations {missing_operation_bodies!r}"
         )
 
-    missing_operation_surfaces = sorted(operation_surface_ids - surface_ids)
+    missing_operation_surfaces = sorted(operation_surface_ids - covered_surface_ids)
     if missing_operation_surfaces:
         errors.append(
             f"cut operations expose missing surfaces {missing_operation_surfaces!r}"
@@ -169,19 +177,16 @@ def validate_route_volume_surface_refs(
     route: RouteLiteral,
     volumes: tuple[VolumePlanRecord, ...],
 ) -> None:
-    """Fail fast when Route C retained volumes have no planned boundaries."""
-    if route != "C":
-        return
+    """Fail fast when backend-live volumes have no planned boundaries."""
+    del route
     missing = sorted(
         volume.volume_id
         for volume in volumes
-        if volume.metadata.get("representation") == "material_volume"
-        and not volume.surface_refs
-        and "geometry_ref" not in volume.metadata
+        if not volume.construction_only and not volume.surface_refs
     )
     if missing:
         raise ValueError(
-            "Route C material volumes require planned boundary surfaces: "
+            "Backend-live volumes require planned boundary surfaces: "
             f"{missing!r}"
         )
 
@@ -193,8 +198,13 @@ def validate_surface_partition_coverage(
     surfaces: tuple[SurfacePlanRecord, ...],
 ) -> None:
     """Validate that partition records point to real parent/child plan ids."""
-    interface_ids = {interface.interface_id for interface in interfaces}
     surfaces_by_id = {surface.surface_id: surface for surface in surfaces}
+    interface_ids = {interface.interface_id for interface in interfaces}
+    interface_ids.update(
+        surface.interface_id
+        for surface in surfaces
+        if surface.interface_id is not None
+    )
     errors: list[str] = []
     partitions_by_parent: dict[str, list[SurfacePartitionRecord]] = {}
     for partition in surface_partitions:
@@ -215,7 +225,11 @@ def validate_surface_partition_coverage(
             )
             continue
         geometry_ref = child_surface.geometry_ref
-        if "outer_loop" not in geometry_ref and "loop_geometry_ref" not in geometry_ref:
+        if (
+            "outer_loop" not in geometry_ref
+            and "loop_geometry_ref" not in geometry_ref
+            and "quad_points" not in geometry_ref
+        ):
             errors.append(
                 f"{partition.partition_id} child surface lacks loop geometry"
             )
@@ -233,32 +247,37 @@ def validate_surface_partition_coverage(
             for partition in partitions
             if partition.band_max_um is not None
         ]
-        if len(core_partitions) != 1:
+        core_min_values = {partition.band_min_um for partition in core_partitions}
+        if not core_partitions or len(core_min_values) != 1:
             errors.append(
-                f"{parent_interface_id} inset children require exactly one core"
+                f"{parent_interface_id} inset children require one core band"
             )
             continue
         expected_min = 0.0
-        for partition in sorted(
-            band_partitions,
-            key=lambda item: item.band_min_um if item.band_min_um is not None else -1.0,
-        ):
-            if partition.band_min_um is None:
-                errors.append(f"{partition.partition_id} band_min_um is required")
+        band_ranges = sorted(
+            {
+                (partition.band_min_um, partition.band_max_um)
+                for partition in band_partitions
+            },
+            key=lambda item: item[0] if item[0] is not None else -1.0,
+        )
+        for band_min_um, band_max_um in band_ranges:
+            if band_min_um is None:
+                errors.append(f"{parent_interface_id} band_min_um is required")
                 continue
-            if partition.band_min_um != expected_min:
+            if band_min_um != expected_min:
                 errors.append(
-                    f"{partition.partition_id} starts at {partition.band_min_um}, "
+                    f"{parent_interface_id} band starts at {band_min_um}, "
                     f"expected {expected_min}"
                 )
             if (
-                partition.band_max_um is None
-                or partition.band_max_um <= partition.band_min_um
+                band_max_um is None
+                or band_max_um <= band_min_um
             ):
-                errors.append(f"{partition.partition_id} has invalid band range")
+                errors.append(f"{parent_interface_id} has invalid band range")
                 continue
-            expected_min = partition.band_max_um
-        core_min = core_partitions[0].band_min_um
+            expected_min = band_max_um
+        core_min = next(iter(core_min_values))
         if core_min is not None and core_min != expected_min:
             errors.append(
                 f"{core_partitions[0].partition_id} starts at {core_min}, "
@@ -274,17 +293,17 @@ def validate_tag_plan_coverage(
     volumes: tuple[VolumePlanRecord, ...],
     tags: tuple[TagPlanRecord, ...],
 ) -> None:
-    """Validate that every backend-live geometry record has a tag plan.
+    """Validate that every exported geometry record has a tag plan.
 
-    Backend construction may create construction-only helper surfaces or
-    volumes, but anything live in the final geometry must have a `TagPlanRecord`
-    before OCC assigns dim-tags. This keeps physical groups a deterministic
-    projection of the plan rather than a backend afterthought.
+    Boundary surfaces can be backend-live topology used to close volumes without
+    being exported as standalone surface physical groups. Interface surfaces and
+    non-construction volumes must have `TagPlanRecord`s before OCC assigns
+    dim-tags.
     """
     live_sources = {
         ("surface", surface.surface_id)
         for surface in surfaces
-        if not surface.construction_only
+        if not surface.construction_only and surface.interface_id is not None
     }
     live_sources.update(
         ("volume", volume.volume_id)
@@ -336,4 +355,3 @@ def _requires_route_representation(entity: SemanticEntitySpec) -> bool:
         return True
     role_tokens = set(str(entity.role).lower().replace("_", " ").split())
     return bool(role_tokens & {"metal", "conductor"})
-

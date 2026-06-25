@@ -5,8 +5,16 @@ The v1 direction is surface-plan and tag-plan first:
 `GeometryBuildInput -> InterfacePlan -> SurfacePartition -> SurfacePlan
 -> VolumePlan / ConstructionBodyPlan -> CutHostOperationPlan -> TagPlan`.
 
-Backends must build planned surfaces and volumes directly, for example with
-`addCurveLoop()`, `addPlaneSurface()`, `addSurfaceLoop()`, and `addVolume()`.
+Backends must build every planned surface before they build any backend-live
+volume. A volume is valid only after all of its boundary faces are represented
+by `SurfacePlanRecord`s and referenced by `SurfaceRefRecord`s. The OCC lowering
+contract is therefore:
+
+`addPoint() -> addLine() -> addCurveLoop() -> addPlaneSurface()` for controlled
+surfaces, then `addSurfaceLoop() -> addVolume()` for volumes.
+
+Direct volume creation from boxes, extrusions, or unplanned bounds is not a v1
+production path because it hides boundary surfaces from the semantic tag plan.
 Global OCC fragment is not the semantic discovery mechanism.
 """
 
@@ -218,6 +226,12 @@ class SurfaceRefRecord:
 @dataclass(frozen=True)
 class VolumePlanRecord:
     """One planned volume assembled from already-planned surfaces.
+
+    Backend-live volumes must be created from `surface_refs`: the planner first
+    controls every boundary surface, and the backend then calls
+    `addSurfaceLoop()` plus `addVolume()` on those surfaces. `metadata` may keep
+    domain bounds, material, or stack provenance for audit, but those records are
+    not permission to create a box or extruded fallback volume.
 
     Route C material volumes are backend-live solver geometry. Route A/B
     construction cutters are not represented here; they use
