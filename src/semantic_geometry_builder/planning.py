@@ -74,6 +74,7 @@ Hard invariants for this registry:
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from math import sqrt
 from typing import Any
 
@@ -81,6 +82,7 @@ from semantic_geometry_builder.models import (
     ConstructionBodyPlanRecord,
     ConstructionPlanRecord,
     CurvePlanRecord,
+    CurveRefRecord,
     CutHostOperationRecord,
     GeometryBuildInput,
     InterfacePlanRecord,
@@ -88,6 +90,7 @@ from semantic_geometry_builder.models import (
     RouteLiteral,
     SemanticEntitySpec,
     SurfaceLoopRecord,
+    SurfaceOrientationLiteral,
     SurfacePartitionRecord,
     SurfacePlanRecord,
     SurfaceRefRecord,
@@ -175,6 +178,10 @@ def build_route_construction_plan(
         route=route,
         surfaces=surfaces,
     )
+    interfaces = complete_interface_plan_from_surfaces(
+        interfaces=interfaces,
+        surfaces=surfaces,
+    )
     points, curves, surface_loops, surfaces = plan_canonical_topology(
         surfaces=surfaces,
     )
@@ -233,6 +240,55 @@ def build_route_construction_plan(
     )
 
 
+def complete_interface_plan_from_surfaces(
+    *,
+    interfaces: tuple[InterfacePlanRecord, ...],
+    surfaces: tuple[SurfacePlanRecord, ...],
+) -> tuple[InterfacePlanRecord, ...]:
+    """Backfill InterfacePlan records for planned adjacency surfaces."""
+    known = {interface.interface_id for interface in interfaces}
+    completed = list(interfaces)
+    for surface in surfaces:
+        if surface.interface_id is None or surface.interface_id in known:
+            continue
+        kind = surface.interface_id.split("__", 1)[0]
+        if kind not in _INTERFACE_KIND_ORDER:
+            raise ValueError(f"invalid surface interface id: {surface.interface_id}")
+        owners = _surface_owner_ids(surface)
+        record_owners = owners
+        if len(record_owners) != 2:
+            boundary_owners = _surface_boundary_volume_ids(
+                surface,
+                known_entity_ids=set(owners),
+            )
+            if len(boundary_owners) == 2:
+                record_owners = boundary_owners
+        if len(record_owners) != 2:
+            raise ValueError(
+                f"{surface.surface_id} interface needs two owners, got {owners!r}"
+            )
+        completed.append(
+            InterfacePlanRecord(
+                interface_id=surface.interface_id,
+                kind=kind,  # type: ignore[arg-type]
+                owner_semantic_ids=(record_owners[0], record_owners[1]),
+                recognition_rule=str(
+                    surface.metadata.get(
+                        "recognition_rule",
+                        "planned_surface_adjacency",
+                    )
+                ),
+                solver_use=surface.solver_use,
+                metadata={
+                    "generated_from_surface_id": surface.surface_id,
+                    **dict(surface.metadata),
+                },
+            )
+        )
+        known.add(surface.interface_id)
+    return tuple(completed)
+
+
 def plan_canonical_topology(
     *,
     surfaces: tuple[SurfacePlanRecord, ...],
@@ -262,13 +318,263 @@ def plan_canonical_topology(
     implemented. Raw `geometry_ref` lowering is not a v1 conformal-geometry
     contract.
     """
-    if surfaces:
-        raise NotImplementedError(
-            "canonical PointPlan/CurvePlan/SurfaceLoop planning is required "
-            "before backend lowering; raw SurfacePlan geometry_ref is audit "
-            "metadata only"
+    point_ids: dict[tuple[float, float, float], str] = {}
+    point_coordinates: dict[str, tuple[float, float, float]] = {}
+    point_curve_ids: dict[str, set[str]] = {}
+    curve_ids: dict[tuple[str, str], str] = {}
+    curve_owner_ids: dict[str, set[str]] = {}
+    curve_interface_ids: dict[str, set[str]] = {}
+    curve_surface_ids: dict[str, set[str]] = {}
+    curve_volume_ids: dict[str, set[str]] = {}
+    loop_ids: dict[tuple[str, tuple[str, ...]], str] = {}
+    loops: dict[str, SurfaceLoopRecord] = {}
+    canonical_surfaces: list[SurfacePlanRecord] = []
+    surface_specs: list[
+        tuple[
+            SurfacePlanRecord,
+            tuple[tuple[str, int, tuple[tuple[float, float, float], ...]], ...],
+        ]
+    ] = []
+
+    def point_id(coordinate: tuple[float, float, float]) -> str:
+        key = _coordinate_key(coordinate)
+        existing = point_ids.get(key)
+        if existing is not None:
+            return existing
+        new_id = f"P__{len(point_ids):06d}"
+        point_ids[key] = new_id
+        point_coordinates[new_id] = key
+        point_curve_ids[new_id] = set()
+        return new_id
+
+    for surface in surfaces:
+        if surface.construction_only:
+            canonical_surfaces.append(surface)
+            continue
+        specs = _surface_ring3d_specs(surface)
+        surface_specs.append((surface, specs))
+        for _, _, ring in specs:
+            for coordinate in ring:
+                point_id(coordinate)
+
+    def split_edge_points(
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+    ) -> tuple[tuple[float, float, float], ...]:
+        points_on_edge = [
+            (parameter, coordinate)
+            for coordinate in point_coordinates.values()
+            for parameter in (_segment_parameter(coordinate, start, end),)
+            if parameter is not None
+        ]
+        return tuple(coordinate for _, coordinate in sorted(points_on_edge))
+
+    def curve_ref(
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+        surface: SurfacePlanRecord,
+    ) -> CurveRefRecord:
+        start_id = point_id(start)
+        end_id = point_id(end)
+        if start_id == end_id:
+            raise ValueError(f"{surface.surface_id} has zero-length curve")
+        key = tuple(sorted((start_id, end_id)))
+        curve_id = curve_ids.get(key)
+        if curve_id is None:
+            curve_id = f"C__{len(curve_ids):06d}"
+            curve_ids[key] = curve_id
+        point_curve_ids[start_id].add(curve_id)
+        point_curve_ids[end_id].add(curve_id)
+        curve_owner_ids.setdefault(curve_id, set()).update(
+            str(owner_id)
+            for owner_id in _surface_owner_ids(surface)
         )
-    return (), (), (), surfaces
+        if surface.interface_id is not None:
+            curve_interface_ids.setdefault(curve_id, set()).add(surface.interface_id)
+        curve_surface_ids.setdefault(curve_id, set()).add(surface.surface_id)
+        curve_volume_ids.setdefault(curve_id, set()).update(
+            str(volume_id)
+            for volume_id in surface.metadata.get("boundary_volume_ids", ())
+        )
+        return CurveRefRecord(
+            curve_id=curve_id,
+            orientation=1 if key == (start_id, end_id) else -1,
+            role="boundary",
+        )
+
+    for surface, specs in surface_specs:
+        loop_refs: list[str] = []
+        for role, index, ring in specs:
+            curve_refs = tuple(
+                curve_ref(segment_start, segment_end, surface)
+                for start, end in _ring3d_edges(ring)
+                for split_points in (split_edge_points(start, end),)
+                for segment_start, segment_end in zip(
+                    split_points,
+                    split_points[1:],
+                    strict=False,
+                )
+            )
+            loop_key = (role, tuple(sorted(ref.curve_id for ref in curve_refs)))
+            loop_id = loop_ids.get(loop_key)
+            if loop_id is None:
+                suffix = "OUTER" if role == "outer" else f"HOLE_{index:04d}"
+                loop_id = f"LOOP__{surface.surface_id}__{suffix}"
+                loop_ids[loop_key] = loop_id
+                loops[loop_id] = SurfaceLoopRecord(
+                    loop_id=loop_id,
+                    curve_refs=curve_refs,
+                    role=role,
+                    surface_id=surface.surface_id,
+                )
+            loop_refs.append(loop_id)
+        if not loop_refs:
+            raise ValueError(f"{surface.surface_id} has no planned loops")
+        canonical_surfaces.append(
+            replace(
+                surface,
+                outer_loop_ref=loop_refs[0],
+                hole_loop_refs=tuple(loop_refs[1:]),
+            )
+        )
+
+    points = tuple(
+        PointPlanRecord(
+            point_id=point_id_,
+            coordinate=point_coordinates[point_id_],
+            used_by_curve_ids=tuple(sorted(point_curve_ids[point_id_])),
+        )
+        for point_id_ in sorted(point_coordinates)
+    )
+    curves = tuple(
+        CurvePlanRecord(
+            curve_id=curve_id,
+            curve_kind="line_segment",
+            start_point_id=start_id,
+            end_point_id=end_id,
+            owner_semantic_ids=tuple(sorted(curve_owner_ids.get(curve_id, ()))),
+            interface_ids=tuple(sorted(curve_interface_ids.get(curve_id, ()))),
+            used_by_surface_ids=tuple(sorted(curve_surface_ids.get(curve_id, ()))),
+            boundary_volume_ids=tuple(sorted(curve_volume_ids.get(curve_id, ()))),
+        )
+        for (start_id, end_id), curve_id in sorted(
+            curve_ids.items(),
+            key=lambda item: item[1],
+        )
+    )
+    return points, curves, tuple(loops.values()), tuple(canonical_surfaces)
+
+
+def _surface_ring3d_specs(
+    surface: SurfacePlanRecord,
+) -> tuple[tuple[str, int, tuple[tuple[float, float, float], ...]], ...]:
+    geometry_ref = surface.geometry_ref
+    if "quad_points" in geometry_ref:
+        return (("outer", 0, _clean_ring3d(geometry_ref["quad_points"])),)
+    if "outer_loop" not in geometry_ref:
+        raise ValueError(f"{surface.surface_id} requires outer_loop or quad_points")
+    z_um = _geometry_ref_surface_z_um(geometry_ref)
+    outer_loop = _canonical_planar_loop_orientation(
+        _clean_loop(geometry_ref["outer_loop"])
+    )
+    specs = [
+        (
+            "outer",
+            0,
+            tuple((x, y, z_um) for x, y in outer_loop),
+        )
+    ]
+    specs.extend(
+        (
+            "hole",
+            index,
+            tuple(
+                (x, y, z_um)
+                for x, y in _canonical_planar_loop_orientation(
+                    _clean_loop(hole_loop)
+                )
+            ),
+        )
+        for index, hole_loop in enumerate(geometry_ref.get("hole_loops", ()))
+    )
+    return tuple(specs)
+
+
+def _canonical_planar_loop_orientation(
+    loop: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...]:
+    """Use one XY loop direction for OCC plane surfaces and their holes."""
+    if _polygon_area(loop) < 0:
+        return tuple(reversed(loop))
+    return loop
+
+
+def _geometry_ref_surface_z_um(geometry_ref: Mapping[str, Any]) -> float:
+    z_min_um = float(geometry_ref.get("z_min_um", geometry_ref.get("z_um", 0.0)))
+    if geometry_ref.get("shell_part") == "top":
+        return z_min_um + float(geometry_ref.get("thickness_um", 0.0))
+    if geometry_ref.get("shell_part") == "bottom":
+        return z_min_um
+    plane = geometry_ref.get("plane") or geometry_ref.get("contact_plane")
+    if isinstance(plane, Mapping) and plane.get("axis") == "z":
+        return float(plane["value_um"])
+    return z_min_um
+
+
+def _clean_ring3d(ring: Any) -> tuple[tuple[float, float, float], ...]:
+    points = tuple(
+        (float(point[0]), float(point[1]), float(point[2]))
+        for point in ring
+    )
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+    if len(points) < 3:
+        raise ValueError("3D loop requires at least 3 unique points")
+    return points
+
+
+def _ring3d_edges(
+    ring: tuple[tuple[float, float, float], ...],
+) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
+    return tuple(
+        (ring[index], ring[(index + 1) % len(ring)])
+        for index in range(len(ring))
+    )
+
+
+def _coordinate_key(
+    coordinate: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return tuple(round(float(value), 9) for value in coordinate)
+
+
+def _segment_parameter(
+    point: tuple[float, float, float],
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+) -> float | None:
+    vector = tuple(end[index] - start[index] for index in range(3))
+    offset = tuple(point[index] - start[index] for index in range(3))
+    length_sq = sum(value * value for value in vector)
+    if length_sq <= 1e-18:
+        return None
+    parameter = sum(offset[index] * vector[index] for index in range(3)) / length_sq
+    if parameter < -1e-9 or parameter > 1.0 + 1e-9:
+        return None
+    closest = tuple(start[index] + parameter * vector[index] for index in range(3))
+    distance_sq = sum((point[index] - closest[index]) ** 2 for index in range(3))
+    if distance_sq > 1e-18:
+        return None
+    return max(0.0, min(1.0, parameter))
+
+
+def _surface_owner_ids(surface: SurfacePlanRecord) -> tuple[str, ...]:
+    owner_ids = surface.metadata.get("owner_semantic_ids", (surface.owner_semantic_id,))
+    if isinstance(owner_ids, str):
+        return (owner_ids,)
+    if isinstance(owner_ids, Sequence):
+        return tuple(str(owner_id) for owner_id in owner_ids)
+    return (surface.owner_semantic_id,)
 
 
 def recognize_route_interfaces(
@@ -569,7 +875,11 @@ def plan_route_construction_bodies(
                     entity,
                     representation=representation,
                 ),
-                expected_surface_ids=_cutout_shell_surface_ids(route, entity),
+                expected_surface_ids=_cutout_shell_surface_ids(
+                    build_input,
+                    route,
+                    entity,
+                ),
                 valid_routes=(route,),
             )
         )
@@ -761,14 +1071,14 @@ def plan_route_surfaces(
                 build_input,
                 entity,
             )
-            sidewall_interface_kind = _conductor_solution_interface_kind(
-                _entity_by_id(build_input, sidewall_adjacent_id)
+            sidewall_geometry_refs = _conductor_sidewall_geometry_refs(
+                build_input,
+                route=route,
+                entity=entity,
+                representation=representation,
+                adjacent_solution_id=sidewall_adjacent_id,
             )
-            for edge_index, geometry_ref in enumerate(
-                _sidewall_geometry_refs(
-                    _entity_geometry_ref(entity, representation=representation)
-                )
-            ):
+            for edge_index, geometry_ref in enumerate(sidewall_geometry_refs):
                 shell_part = f"sidewall_{edge_index:04d}"
                 surface_id = _conductor_boundary_surface_id(
                     route,
@@ -777,6 +1087,42 @@ def plan_route_surfaces(
                     shell_part,
                 )
                 body = construction_body_by_surface_id.get(surface_id)
+                sidewall_adjacent_owner_id = str(
+                    geometry_ref.get(
+                        "adjacent_conductor_semantic_id",
+                        sidewall_adjacent_id,
+                    )
+                )
+                sidewall_interface_kind = (
+                    "MM"
+                    if "adjacent_conductor_semantic_id" in geometry_ref
+                    else _conductor_solution_interface_kind(
+                        _entity_by_id(build_input, sidewall_adjacent_id)
+                    )
+                )
+                sidewall_interface_id = (
+                    None
+                    if geometry_ref.get("solution_exterior_boundary")
+                    else (
+                        f"{sidewall_interface_kind}__{entity.semantic_id}__"
+                        f"{sidewall_adjacent_owner_id}__"
+                        f"{shell_part.upper()}"
+                    )
+                )
+                sidewall_boundary_volume_ids = (
+                    (entity.semantic_id,)
+                    if geometry_ref.get("solution_exterior_boundary")
+                    else _conductor_boundary_volume_ids(
+                        route,
+                        entity,
+                        sidewall_adjacent_owner_id,
+                    )
+                )
+                sidewall_owner_ids = (
+                    (entity.semantic_id,)
+                    if geometry_ref.get("solution_exterior_boundary")
+                    else (entity.semantic_id, sidewall_adjacent_owner_id)
+                )
                 records.append(
                     SurfacePlanRecord(
                         surface_id=surface_id,
@@ -800,24 +1146,17 @@ def plan_route_surfaces(
                                 else None
                             ),
                         },
-                        interface_id=(
-                            f"{sidewall_interface_kind}__{entity.semantic_id}__"
-                            f"{sidewall_adjacent_id}__"
-                            f"{shell_part.upper()}"
-                        ),
+                        interface_id=sidewall_interface_id,
                         valid_routes=(route,),
                         solver_use="solver_active",
                         metadata={
-                            "interface_kinds": (sidewall_interface_kind,),
-                            "owner_semantic_ids": (
-                                entity.semantic_id,
-                                sidewall_adjacent_id,
+                            "interface_kinds": (
+                                ()
+                                if sidewall_interface_id is None
+                                else (sidewall_interface_kind,)
                             ),
-                            "boundary_volume_ids": _conductor_boundary_volume_ids(
-                                route,
-                                entity,
-                                sidewall_adjacent_id,
-                            ),
+                            "owner_semantic_ids": sidewall_owner_ids,
+                            "boundary_volume_ids": sidewall_boundary_volume_ids,
                             "exposed_surface_role": shell_part,
                         },
                     )
@@ -840,16 +1179,14 @@ def plan_route_volumes(
     are only audit/planning metadata once surface ids exist.
     """
     entity_ids = {entity.semantic_id for entity in build_input.entities}
-    surface_ids_by_owner: dict[str, list[str]] = {}
+    surfaces_by_owner: dict[str, list[SurfacePlanRecord]] = {}
     for surface in surfaces:
         owner_ids = _surface_boundary_volume_ids(
             surface,
             known_entity_ids=entity_ids,
         )
         for owner_id in owner_ids:
-            surface_ids_by_owner.setdefault(str(owner_id), []).append(
-                surface.surface_id
-            )
+            surfaces_by_owner.setdefault(str(owner_id), []).append(surface)
 
     records: list[VolumePlanRecord] = []
     for entity in build_input.entities:
@@ -861,11 +1198,14 @@ def plan_route_volumes(
                     material_id=entity.material_id,
                     surface_refs=tuple(
                         SurfaceRefRecord(
-                            surface_id=surface_id,
-                            orientation="forward",
+                            surface_id=surface.surface_id,
+                            orientation=_surface_orientation_for_volume(
+                                surface,
+                                entity,
+                            ),
                             role="planned_boundary",
                         )
-                        for surface_id in surface_ids_by_owner.get(
+                        for surface in surfaces_by_owner.get(
                             entity.semantic_id,
                             (),
                         )
@@ -887,11 +1227,14 @@ def plan_route_volumes(
                     material_id=entity.material_id,
                     surface_refs=tuple(
                         SurfaceRefRecord(
-                            surface_id=surface_id,
-                            orientation="forward",
+                            surface_id=surface.surface_id,
+                            orientation=_surface_orientation_for_volume(
+                                surface,
+                                entity,
+                            ),
                             role="planned_boundary",
                         )
-                        for surface_id in surface_ids_by_owner.get(
+                        for surface in surfaces_by_owner.get(
                             entity.semantic_id,
                             (),
                         )
@@ -1148,26 +1491,15 @@ def _plan_substrate_air_surfaces(
             z_um=z_um,
             base_loop=base_loop,
         )
-        derived_ground_entities = [
-            entity
-            for entity in plane_conductors
-            if entity.geometry.get("geometry_source") == "die_face_minus_ground_mask"
-        ]
-        if derived_ground_entities:
-            loop_groups = tuple(
-                (loop, tuple(entity for entity in plane_conductors if entity != ground))
-                for ground in derived_ground_entities
-                for loop in ground.geometry.get("hole_loops", ())
-            )
-        else:
-            loop_groups = ((base_loop, plane_conductors),)
-
-        for outer_loop, hole_entities in loop_groups:
-            hole_loops = tuple(
-                entity.geometry["outer_loop"]
-                for entity in hole_entities
-                if _loop_inside_loop(entity.geometry["outer_loop"], outer_loop)
-            )
+        solution_geometry_refs = _solution_interface_geometry_refs(
+            {
+                "plane": {"axis": "z", "value_um": z_um},
+                "outer_loop": base_loop,
+                "hole_loops": (),
+            },
+            plane_conductors,
+        )
+        for geometry_ref in solution_geometry_refs:
             interface_id = (
                 f"{kind}__{owner_ids[0]}__{owner_ids[1]}__{surface_index:04d}"
             )
@@ -1176,11 +1508,7 @@ def _plan_substrate_air_surfaces(
                     surface_id=f"SURF__{interface_id}",
                     owner_semantic_id=owner_ids[0],
                     surface_role="solution_interface",
-                    geometry_ref={
-                        "plane": {"axis": "z", "value_um": z_um},
-                        "outer_loop": outer_loop,
-                        "hole_loops": hole_loops,
-                    },
+                    geometry_ref=geometry_ref,
                     interface_id=interface_id,
                     valid_routes=(route,),
                     solver_use="solver_active",
@@ -1193,6 +1521,163 @@ def _plan_substrate_air_surfaces(
             )
             surface_index += 1
     return tuple(records)
+
+
+def _solution_interface_geometry_refs(
+    parent_geometry_ref: Mapping[str, Any],
+    plane_conductors: Sequence[SemanticEntitySpec],
+) -> tuple[dict[str, Any], ...]:
+    """Create live solution-interface patches after removing conductors."""
+    import gdstk
+
+    hole_loops = _simple_interior_hole_loops(parent_geometry_ref, plane_conductors)
+    if hole_loops is not None:
+        return ({**dict(parent_geometry_ref), "hole_loops": hole_loops},)
+
+    base_region = _gdstk_surface_region(parent_geometry_ref)
+    conductor_region = tuple(
+        polygon
+        for entity in plane_conductors
+        for polygon in _entity_occupied_region(gdstk, entity)
+    )
+    live_region = _boolean_gdstk_region(
+        gdstk,
+        base_region,
+        conductor_region,
+        "not",
+    )
+    return _geometry_refs_from_gdstk_region(parent_geometry_ref, live_region)
+
+
+def _simple_interior_hole_loops(
+    parent_geometry_ref: Mapping[str, Any],
+    plane_conductors: Sequence[SemanticEntitySpec],
+) -> tuple[tuple[tuple[float, float], ...], ...] | None:
+    if any(entity.geometry.get("hole_loops") for entity in plane_conductors):
+        return None
+    base_loop = _clean_loop(parent_geometry_ref["outer_loop"])
+    hole_loops = tuple(
+        _clean_loop(entity.geometry["outer_loop"])
+        for entity in plane_conductors
+        if "outer_loop" in entity.geometry
+    )
+    if len(hole_loops) != len(plane_conductors):
+        return None
+    if any(not _loop_inside_loop(hole_loop, base_loop) for hole_loop in hole_loops):
+        return None
+    all_loops = (base_loop, *hole_loops)
+    for index, left in enumerate(all_loops):
+        for right in all_loops[index + 1 :]:
+            if _loops_share_edge_overlap(left, right):
+                return None
+    return hole_loops
+
+
+def _loops_share_edge_overlap(
+    left: tuple[tuple[float, float], ...],
+    right: tuple[tuple[float, float], ...],
+) -> bool:
+    return any(
+        _segment_overlap_interval(left_start, left_end, right_start, right_end)
+        is not None
+        for left_start, left_end in _ring_edges(left)
+        for right_start, right_end in _ring_edges(right)
+    )
+
+
+def _entity_occupied_region(gdstk: Any, entity: SemanticEntitySpec) -> tuple[Any, ...]:
+    if "outer_loop" not in entity.geometry:
+        return ()
+    outer = gdstk.Polygon(_clean_loop(entity.geometry["outer_loop"]))
+    holes = tuple(
+        gdstk.Polygon(_clean_loop(hole_loop))
+        for hole_loop in entity.geometry.get("hole_loops", ())
+    )
+    if not holes:
+        return _filter_gdstk_polygons((outer,))
+    return _boolean_gdstk_region(gdstk, (outer,), holes, "not")
+
+
+def _solution_domain_sidewall_geometry_refs(
+    build_input: GeometryBuildInput,
+    *,
+    route: RouteLiteral,
+    solution: SemanticEntitySpec,
+    outer_loop: tuple[tuple[float, float], ...],
+    z_min_um: float,
+    z_max_um: float,
+) -> tuple[dict[str, Any], ...]:
+    refs: list[dict[str, Any]] = []
+    for edge_index, (start, end) in enumerate(_ring_edges(_clean_loop(outer_loop))):
+        edge_z_min_um = _solution_boundary_edge_z_min_um(
+            build_input,
+            route=route,
+            solution=solution,
+            start=start,
+            end=end,
+            default_z_min_um=z_min_um,
+        )
+        if z_max_um - edge_z_min_um <= _INSET_EPS_UM:
+            continue
+        refs.append(
+            {
+                "quad_points": (
+                    (start[0], start[1], edge_z_min_um),
+                    (end[0], end[1], edge_z_min_um),
+                    (end[0], end[1], z_max_um),
+                    (start[0], start[1], z_max_um),
+                ),
+                "sidewall_ring_role": "outer",
+                "sidewall_edge_index": edge_index,
+            }
+        )
+    return tuple(refs)
+
+
+def _solution_boundary_edge_z_min_um(
+    build_input: GeometryBuildInput,
+    *,
+    route: RouteLiteral,
+    solution: SemanticEntitySpec,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    default_z_min_um: float,
+) -> float:
+    if not _is_air_like_solution_entity(solution):
+        return default_z_min_um
+    z_min_um = default_z_min_um
+    for entity in build_input.entities:
+        if (
+            _is_solution_entity(entity)
+            or entity.route_representations.get(route) not in {
+                "cutout_boundary_shell",
+                "material_volume",
+            }
+            or "outer_loop" not in entity.geometry
+        ):
+            continue
+        entity_z_min_um, entity_z_max_um = _entity_z_range_um(entity)
+        if not _same_z(entity_z_min_um, default_z_min_um):
+            continue
+        if _edge_matches_loop_edge(start, end, entity.geometry["outer_loop"]):
+            z_min_um = max(z_min_um, entity_z_max_um)
+    return z_min_um
+
+
+def _edge_matches_loop_edge(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    loop: Any,
+) -> bool:
+    edge_key = {_point2d_key(start), _point2d_key(end)}
+    return any(
+        {_point2d_key(edge_start), _point2d_key(edge_end)} == edge_key
+        for edge_start, edge_end in _ring_edges(_clean_loop(loop))
+    )
+
+
+def _point2d_key(point: tuple[float, float]) -> tuple[float, float]:
+    return (round(float(point[0]), 9), round(float(point[1]), 9))
 
 
 def _plan_solution_domain_boundary_surfaces(
@@ -1236,13 +1721,13 @@ def _plan_solution_domain_boundary_surfaces(
                 )
             )
         for edge_index, geometry_ref in enumerate(
-            _sidewall_geometry_refs(
-                {
-                    "outer_loop": loop,
-                    "hole_loops": (),
-                    "z_min_um": z_min_um,
-                    "thickness_um": z_max_um - z_min_um,
-                }
+            _solution_domain_sidewall_geometry_refs(
+                build_input,
+                route=route,
+                solution=entity,
+                outer_loop=loop,
+                z_min_um=z_min_um,
+                z_max_um=z_max_um,
             )
         ):
             records.append(
@@ -1266,6 +1751,7 @@ def _plan_solution_domain_boundary_surfaces(
 
 
 def _cutout_shell_surface_ids(
+    build_input: GeometryBuildInput,
     route: RouteLiteral,
     entity: SemanticEntitySpec,
 ) -> tuple[str, ...]:
@@ -1286,11 +1772,15 @@ def _cutout_shell_surface_ids(
             f"sidewall_{edge_index:04d}",
         )
         for edge_index, _ in enumerate(
-            _sidewall_geometry_refs(
-                _entity_geometry_ref(
+            _conductor_sidewall_geometry_refs(
+                build_input,
+                route=route,
+                entity=entity,
+                representation="cutout_boundary_shell",
+                adjacent_solution_id=_conductor_sidewall_adjacent_solution_id(
+                    build_input,
                     entity,
-                    representation="cutout_boundary_shell",
-                )
+                ),
             )
         )
     )
@@ -1386,6 +1876,102 @@ def _surface_boundary_volume_ids(
             f"{surface.surface_id} belongs to more than two volumes: {result!r}"
         )
     return result
+
+
+def _surface_orientation_for_volume(
+    surface: SurfacePlanRecord,
+    entity: SemanticEntitySpec,
+) -> SurfaceOrientationLiteral:
+    """Orient a planned surface as an outward face of one owning volume."""
+    normal = _surface_normal_vector(surface)
+    surface_centroid = _surface_centroid(surface)
+    volume_center = _entity_volume_center_um(entity)
+    outward = tuple(
+        surface_centroid[index] - volume_center[index]
+        for index in range(3)
+    )
+    dot = sum(normal[index] * outward[index] for index in range(3))
+    if abs(dot) <= 1e-9:
+        raise ValueError(
+            f"{surface.surface_id} has ambiguous orientation for "
+            f"{entity.semantic_id}"
+        )
+    return "forward" if dot > 0 else "reversed"
+
+
+def _surface_normal_vector(surface: SurfacePlanRecord) -> tuple[float, float, float]:
+    if surface.normal_hint is not None:
+        return tuple(float(value) for value in surface.normal_hint)
+    ring = _surface_ring3d_specs(surface)[0][2]
+    origin = ring[0]
+    for first_index in range(1, len(ring) - 1):
+        first = _vector_subtract(ring[first_index], origin)
+        for second_index in range(first_index + 1, len(ring)):
+            second = _vector_subtract(ring[second_index], origin)
+            normal = _vector_cross(first, second)
+            length_sq = sum(value * value for value in normal)
+            if length_sq > 1e-18:
+                return normal
+    raise ValueError(f"{surface.surface_id} has no nondegenerate normal")
+
+
+def _surface_centroid(surface: SurfacePlanRecord) -> tuple[float, float, float]:
+    points = tuple(
+        coordinate
+        for _, _, ring in _surface_ring3d_specs(surface)
+        for coordinate in ring
+    )
+    if not points:
+        raise ValueError(f"{surface.surface_id} has no coordinates")
+    return (
+        sum(point[0] for point in points) / len(points),
+        sum(point[1] for point in points) / len(points),
+        sum(point[2] for point in points) / len(points),
+    )
+
+
+def _entity_volume_center_um(
+    entity: SemanticEntitySpec,
+) -> tuple[float, float, float]:
+    if _is_solution_entity(entity):
+        bounds = _solution_bounds(entity)
+        return (
+            (float(bounds["x_min_um"]) + float(bounds["x_max_um"])) / 2.0,
+            (float(bounds["y_min_um"]) + float(bounds["y_max_um"])) / 2.0,
+            (float(entity.geometry["z_min_um"]) + float(entity.geometry["z_max_um"]))
+            / 2.0,
+        )
+    if "outer_loop" not in entity.geometry:
+        raise ValueError(f"{entity.semantic_id} requires outer_loop for volume center")
+    loop = _clean_loop(entity.geometry["outer_loop"])
+    z_min_um, z_max_um = _entity_z_range_um(entity)
+    return (
+        (min(point[0] for point in loop) + max(point[0] for point in loop)) / 2.0,
+        (min(point[1] for point in loop) + max(point[1] for point in loop)) / 2.0,
+        (z_min_um + z_max_um) / 2.0,
+    )
+
+
+def _vector_subtract(
+    left: tuple[float, float, float],
+    right: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        left[0] - right[0],
+        left[1] - right[1],
+        left[2] - right[2],
+    )
+
+
+def _vector_cross(
+    left: tuple[float, float, float],
+    right: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    )
 
 
 def _unique_ids(values: Any) -> tuple[str, ...]:
@@ -1753,6 +2339,330 @@ def _sidewall_geometry_refs(
     return tuple(refs)
 
 
+def _conductor_sidewall_geometry_refs(
+    build_input: GeometryBuildInput,
+    *,
+    route: RouteLiteral,
+    entity: SemanticEntitySpec,
+    representation: str,
+    adjacent_solution_id: str,
+) -> tuple[dict[str, Any], ...]:
+    refs = _sidewall_geometry_refs(
+        _entity_geometry_ref(entity, representation=representation)
+    )
+    if route == "C":
+        return _route_c_conductor_sidewall_geometry_refs(
+            build_input,
+            entity=entity,
+            adjacent_solution=_entity_by_id(build_input, adjacent_solution_id),
+            refs=refs,
+        )
+    adjacent_solution = _entity_by_id(build_input, adjacent_solution_id)
+    exposed_refs: list[dict[str, Any]] = []
+    for geometry_ref in refs:
+        if _sidewall_on_solution_outer_boundary(geometry_ref, adjacent_solution):
+            continue
+        exposed_refs.extend(
+            _trim_sidewall_ref_against_route_conductors(
+                build_input,
+                route=route,
+                entity=entity,
+                geometry_ref=geometry_ref,
+            )
+        )
+    return tuple(exposed_refs)
+
+
+def _route_c_conductor_sidewall_geometry_refs(
+    build_input: GeometryBuildInput,
+    *,
+    entity: SemanticEntitySpec,
+    adjacent_solution: SemanticEntitySpec,
+    refs: tuple[dict[str, Any], ...],
+) -> tuple[dict[str, Any], ...]:
+    result: list[dict[str, Any]] = []
+    for geometry_ref in refs:
+        points = geometry_ref.get("quad_points", ())
+        if len(points) != 4:
+            result.append(dict(geometry_ref))
+            continue
+        start = (float(points[0][0]), float(points[0][1]))
+        end = (float(points[1][0]), float(points[1][1]))
+        exterior_intervals = (
+            ((0.0, 1.0),)
+            if _sidewall_on_solution_outer_boundary(geometry_ref, adjacent_solution)
+            else ()
+        )
+        contact_intervals = _route_c_contact_intervals(
+            build_input,
+            entity=entity,
+            start=start,
+            end=end,
+        )
+        result.extend(
+            _sidewall_subsegment_geometry_ref(
+                geometry_ref,
+                interval_start,
+                interval_end,
+                extra={"solution_exterior_boundary": True},
+            )
+            for interval_start, interval_end in exterior_intervals
+        )
+        result.extend(
+            _sidewall_subsegment_geometry_ref(
+                geometry_ref,
+                interval_start,
+                interval_end,
+                extra={"adjacent_conductor_semantic_id": adjacent_id},
+            )
+            for (
+                interval_start,
+                interval_end,
+                adjacent_id,
+                create_surface,
+            ) in contact_intervals
+            if create_surface
+        )
+        blocked = (
+            *exterior_intervals,
+            *((start, end) for start, end, _, _ in contact_intervals),
+        )
+        result.extend(
+            _sidewall_subsegment_geometry_ref(
+                geometry_ref,
+                interval_start,
+                interval_end,
+            )
+            for interval_start, interval_end in _interval_complement(blocked)
+        )
+    return tuple(result)
+
+
+def _route_c_contact_intervals(
+    build_input: GeometryBuildInput,
+    *,
+    entity: SemanticEntitySpec,
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> tuple[tuple[float, float, str, bool], ...]:
+    records: list[tuple[float, float, str, bool]] = []
+    for other in build_input.entities:
+        if not _can_trim_against_route_conductor(
+            "C",
+            entity=entity,
+            other=other,
+        ):
+            continue
+        for other_start, other_end in _entity_boundary_edges(other):
+            interval = _segment_overlap_interval(start, end, other_start, other_end)
+            if interval is None:
+                continue
+            records.append(
+                (
+                    interval[0],
+                    interval[1],
+                    other.semantic_id,
+                    entity.semantic_id < other.semantic_id,
+                )
+            )
+    return tuple(records)
+
+
+def _trim_sidewall_ref_against_route_conductors(
+    build_input: GeometryBuildInput,
+    *,
+    route: RouteLiteral,
+    entity: SemanticEntitySpec,
+    geometry_ref: Mapping[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    points = geometry_ref.get("quad_points", ())
+    if len(points) != 4:
+        return (dict(geometry_ref),)
+    start = (float(points[0][0]), float(points[0][1]))
+    end = (float(points[1][0]), float(points[1][1]))
+    covered_intervals: list[tuple[float, float]] = []
+    for other in build_input.entities:
+        if not _can_trim_against_route_conductor(
+            route,
+            entity=entity,
+            other=other,
+        ):
+            continue
+        for other_start, other_end in _entity_boundary_edges(other):
+            interval = _segment_overlap_interval(start, end, other_start, other_end)
+            if interval is not None:
+                covered_intervals.append(interval)
+    if not covered_intervals:
+        return (dict(geometry_ref),)
+    return tuple(
+        _sidewall_subsegment_geometry_ref(
+            geometry_ref,
+            start_parameter,
+            end_parameter,
+        )
+        for start_parameter, end_parameter in _interval_complement(
+            covered_intervals,
+        )
+        if end_parameter - start_parameter > _INSET_EPS_UM
+    )
+
+
+def _can_trim_against_route_conductor(
+    route: RouteLiteral,
+    *,
+    entity: SemanticEntitySpec,
+    other: SemanticEntitySpec,
+) -> bool:
+    if (
+        other.semantic_id == entity.semantic_id
+        or _is_solution_entity(other)
+        or other.route_representations.get(route) is None
+        or "outer_loop" not in other.geometry
+    ):
+        return False
+    z_min_um, z_max_um = _entity_z_range_um(entity)
+    other_z_min_um, other_z_max_um = _entity_z_range_um(other)
+    return _same_z(z_min_um, other_z_min_um) and _same_z(z_max_um, other_z_max_um)
+
+
+def _entity_boundary_edges(
+    entity: SemanticEntitySpec,
+) -> tuple[tuple[tuple[float, float], tuple[float, float]], ...]:
+    return tuple(
+        edge
+        for loop in (
+            entity.geometry["outer_loop"],
+            *entity.geometry.get("hole_loops", ()),
+        )
+        for edge in _ring_edges(_clean_loop(loop))
+    )
+
+
+def _segment_overlap_interval(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    other_start: tuple[float, float],
+    other_end: tuple[float, float],
+) -> tuple[float, float] | None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-18:
+        return None
+
+    def parameter(point: tuple[float, float]) -> float | None:
+        cross = (point[0] - start[0]) * dy - (point[1] - start[1]) * dx
+        if abs(cross) > 1e-9:
+            return None
+        return ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_sq
+
+    first = parameter(other_start)
+    second = parameter(other_end)
+    if first is None or second is None:
+        return None
+    overlap_start = max(0.0, min(first, second))
+    overlap_end = min(1.0, max(first, second))
+    if overlap_end - overlap_start <= _INSET_EPS_UM:
+        return None
+    return overlap_start, overlap_end
+
+
+def _interval_complement(
+    intervals: Sequence[tuple[float, float]],
+) -> tuple[tuple[float, float], ...]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(intervals):
+        start = max(0.0, min(1.0, start))
+        end = max(0.0, min(1.0, end))
+        if end - start <= _INSET_EPS_UM:
+            continue
+        if not merged or start > merged[-1][1] + _INSET_EPS_UM:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    exposed: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in merged:
+        if start - cursor > _INSET_EPS_UM:
+            exposed.append((cursor, start))
+        cursor = max(cursor, end)
+    if 1.0 - cursor > _INSET_EPS_UM:
+        exposed.append((cursor, 1.0))
+    return tuple(exposed)
+
+
+def _sidewall_subsegment_geometry_ref(
+    geometry_ref: Mapping[str, Any],
+    start_parameter: float,
+    end_parameter: float,
+    *,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    points = tuple(
+        (float(point[0]), float(point[1]), float(point[2]))
+        for point in geometry_ref["quad_points"]
+    )
+    return {
+        **dict(geometry_ref),
+        "quad_points": (
+            _interpolate_3d(points[0], points[1], start_parameter),
+            _interpolate_3d(points[0], points[1], end_parameter),
+            _interpolate_3d(points[3], points[2], end_parameter),
+            _interpolate_3d(points[3], points[2], start_parameter),
+        ),
+        "trimmed_by_conductor_contact": True,
+        **dict(extra or {}),
+    }
+
+
+def _interpolate_3d(
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+    parameter: float,
+) -> tuple[float, float, float]:
+    return (
+        start[0] + (end[0] - start[0]) * parameter,
+        start[1] + (end[1] - start[1]) * parameter,
+        start[2] + (end[2] - start[2]) * parameter,
+    )
+
+
+def _sidewall_on_solution_outer_boundary(
+    geometry_ref: Mapping[str, Any],
+    solution: SemanticEntitySpec,
+) -> bool:
+    points = geometry_ref.get("quad_points", ())
+    if len(points) != 4:
+        return False
+    start = (float(points[0][0]), float(points[0][1]))
+    end = (float(points[1][0]), float(points[1][1]))
+    bounds = _solution_bounds(solution)
+    x_min = float(bounds["x_min_um"])
+    x_max = float(bounds["x_max_um"])
+    y_min = float(bounds["y_min_um"])
+    y_max = float(bounds["y_max_um"])
+    if _same_z(start[0], x_min) and _same_z(end[0], x_min):
+        return _range_within_bounds(start[1], end[1], y_min, y_max)
+    if _same_z(start[0], x_max) and _same_z(end[0], x_max):
+        return _range_within_bounds(start[1], end[1], y_min, y_max)
+    if _same_z(start[1], y_min) and _same_z(end[1], y_min):
+        return _range_within_bounds(start[0], end[0], x_min, x_max)
+    if _same_z(start[1], y_max) and _same_z(end[1], y_max):
+        return _range_within_bounds(start[0], end[0], x_min, x_max)
+    return False
+
+
+def _range_within_bounds(
+    start: float,
+    end: float,
+    lower: float,
+    upper: float,
+) -> bool:
+    return lower - _INSET_EPS_UM <= min(start, end) and max(start, end) <= (
+        upper + _INSET_EPS_UM
+    )
+
+
 def _clean_loop(loop: Any) -> tuple[tuple[float, float], ...]:
     points = tuple((float(point[0]), float(point[1])) for point in loop)
     if len(points) > 1 and points[0] == points[-1]:
@@ -1822,6 +2732,22 @@ def _planar_inset_geometry_refs(
 ) -> tuple[tuple[str, float | None, float | None, dict[str, Any]], ...]:
     import gdstk
 
+    simple_no_hole_refs = _simple_planar_inset_geometry_refs(
+        gdstk,
+        geometry_ref,
+        breakpoints_um,
+    )
+    if simple_no_hole_refs:
+        return simple_no_hole_refs
+
+    simple_refs = _simple_hole_planar_inset_geometry_refs(
+        gdstk,
+        geometry_ref,
+        breakpoints_um,
+    )
+    if simple_refs:
+        return simple_refs
+
     refs: list[tuple[str, float | None, float | None, dict[str, Any]]] = []
     base_region = _gdstk_surface_region(geometry_ref)
 
@@ -1863,6 +2789,123 @@ def _planar_inset_geometry_refs(
         )
     )
     return tuple(refs)
+
+
+def _simple_planar_inset_geometry_refs(
+    gdstk: Any,
+    geometry_ref: Mapping[str, Any],
+    breakpoints_um: tuple[float, ...],
+) -> tuple[tuple[str, float | None, float | None, dict[str, Any]], ...]:
+    if geometry_ref.get("hole_loops"):
+        return ()
+    outer_loop = _clean_loop(geometry_ref["outer_loop"])
+    refs: list[tuple[str, float | None, float | None, dict[str, Any]]] = []
+    for band_min_um, band_max_um in zip(
+        breakpoints_um,
+        breakpoints_um[1:],
+        strict=False,
+    ):
+        outer_min = _single_offset_loop(gdstk, outer_loop, -band_min_um)
+        outer_max = _single_offset_loop(gdstk, outer_loop, -band_max_um)
+        if outer_min is None or outer_max is None:
+            return ()
+        refs.append(
+            (
+                _inset_band_label(band_min_um, band_max_um),
+                band_min_um,
+                band_max_um,
+                _geometry_ref_with_loops(geometry_ref, outer_min, (outer_max,)),
+            )
+        )
+    core_min_um = breakpoints_um[-1]
+    core_outer = _single_offset_loop(gdstk, outer_loop, -core_min_um)
+    if core_outer is None:
+        return ()
+    refs.append(
+        (
+            _core_label(core_min_um),
+            core_min_um,
+            None,
+            _geometry_ref_with_loops(geometry_ref, core_outer, ()),
+        )
+    )
+    return tuple(refs)
+
+
+def _simple_hole_planar_inset_geometry_refs(
+    gdstk: Any,
+    geometry_ref: Mapping[str, Any],
+    breakpoints_um: tuple[float, ...],
+) -> tuple[tuple[str, float | None, float | None, dict[str, Any]], ...]:
+    hole_loops = tuple(_clean_loop(loop) for loop in geometry_ref.get("hole_loops", ()))
+    if not hole_loops:
+        return ()
+
+    outer_loop = _clean_loop(geometry_ref["outer_loop"])
+    refs: list[tuple[str, float | None, float | None, dict[str, Any]]] = []
+    for band_min_um, band_max_um in zip(
+        breakpoints_um,
+        breakpoints_um[1:],
+        strict=False,
+    ):
+        label = _inset_band_label(band_min_um, band_max_um)
+        outer_min = _single_offset_loop(gdstk, outer_loop, -band_min_um)
+        outer_max = _single_offset_loop(gdstk, outer_loop, -band_max_um)
+        if outer_min is not None and outer_max is not None:
+            refs.append(
+                (
+                    label,
+                    band_min_um,
+                    band_max_um,
+                    _geometry_ref_with_loops(geometry_ref, outer_min, (outer_max,)),
+                )
+            )
+        for hole_loop in hole_loops:
+            hole_min = _single_offset_loop(gdstk, hole_loop, band_min_um)
+            hole_max = _single_offset_loop(gdstk, hole_loop, band_max_um)
+            if hole_min is None or hole_max is None:
+                return ()
+            refs.append(
+                (
+                    label,
+                    band_min_um,
+                    band_max_um,
+                    _geometry_ref_with_loops(geometry_ref, hole_max, (hole_min,)),
+                )
+            )
+
+    core_min_um = breakpoints_um[-1]
+    core_outer = _single_offset_loop(gdstk, outer_loop, -core_min_um)
+    core_holes = tuple(
+        _single_offset_loop(gdstk, hole_loop, core_min_um)
+        for hole_loop in hole_loops
+    )
+    if core_outer is None or any(loop is None for loop in core_holes):
+        return ()
+    refs.append(
+        (
+            _core_label(core_min_um),
+            core_min_um,
+            None,
+            _geometry_ref_with_loops(
+                geometry_ref,
+                core_outer,
+                tuple(loop for loop in core_holes if loop is not None),
+            ),
+        )
+    )
+    return tuple(refs)
+
+
+def _single_offset_loop(
+    gdstk: Any,
+    loop: tuple[tuple[float, float], ...],
+    offset_um: float,
+) -> tuple[tuple[float, float], ...] | None:
+    candidates = _offset_loop_candidates(gdstk, loop, offset_um)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
 
 
 def _planar_inset_band_refs(
@@ -2145,16 +3188,10 @@ def _geometry_refs_from_gdstk_region(
     parent_geometry_ref: Mapping[str, Any],
     region: tuple[Any, ...],
 ) -> tuple[dict[str, Any], ...]:
-    refs: list[dict[str, Any]] = []
-    for polygon in region:
-        pieces = polygon.fracture(max_points=6, precision=1e-9)
-        if not pieces:
-            pieces = [polygon]
-        refs.extend(
-            _geometry_ref_from_gdstk_polygon(parent_geometry_ref, piece)
-            for piece in _filter_gdstk_polygons(pieces)
-        )
-    return tuple(refs)
+    return tuple(
+        _geometry_ref_from_gdstk_polygon(parent_geometry_ref, polygon)
+        for polygon in _filter_gdstk_polygons(region)
+    )
 
 
 def _polygon_area(points: Sequence[Sequence[float]]) -> float:

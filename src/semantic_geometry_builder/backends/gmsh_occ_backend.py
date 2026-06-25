@@ -75,9 +75,18 @@ OCC backend comment block:
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
-from semantic_geometry_builder.models import ConstructionPlanRecord
+from semantic_geometry_builder.models import (
+    BackendEntityTagRecord,
+    ConstructionPlanRecord,
+    GmshDimTag,
+    SurfaceLoopRecord,
+    TagPlanRecord,
+)
 
 
 def write_occ_geometry_from_plan(
@@ -93,10 +102,83 @@ def write_occ_geometry_from_plan(
     volume directly would bypass semantic surface ownership.
     """
     _validate_conformal_plan(plan)
-    raise NotImplementedError(
-        "canonical PointPlan/CurvePlan/SurfaceLoop OCC lowering is not "
-        "implemented yet; raw geometry_ref lowering is disabled"
-    )
+    import gmsh
+
+    xao_path.parent.mkdir(parents=True, exist_ok=True)
+    was_initialized = bool(gmsh.isInitialized())
+    if not was_initialized:
+        gmsh.initialize()
+    try:
+        gmsh.clear()
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add(f"semantic_geometry_route_{plan.route.lower()}")
+
+        point_tags = {
+            point.point_id: gmsh.model.occ.addPoint(*point.coordinate)
+            for point in plan.points
+        }
+        curve_tags = {
+            curve.curve_id: gmsh.model.occ.addLine(
+                point_tags[curve.start_point_id],
+                point_tags[curve.end_point_id],
+            )
+            for curve in plan.curves
+        }
+        loop_tags = {
+            loop.loop_id: _add_curve_loop_from_plan(gmsh, loop, curve_tags)
+            for loop in plan.surface_loops
+        }
+        source_tags: dict[tuple[str, str], list[GmshDimTag]] = {}
+        for surface in plan.surfaces:
+            if surface.construction_only:
+                continue
+            surface_tag = gmsh.model.occ.addPlaneSurface(
+                [
+                    loop_tags[surface.outer_loop_ref],
+                    *(loop_tags[loop_id] for loop_id in surface.hole_loop_refs),
+                ]
+            )
+            source_tags.setdefault(("surface", surface.surface_id), []).append(
+                (2, surface_tag)
+            )
+
+        for volume in plan.volumes:
+            if volume.construction_only:
+                continue
+            surface_tags = _volume_surface_tags(volume, source_tags)
+            shell_tag = gmsh.model.occ.addSurfaceLoop(surface_tags)
+            volume_tag = gmsh.model.occ.addVolume([shell_tag])
+            source_tags.setdefault(("volume", volume.volume_id), []).append(
+                (3, volume_tag)
+            )
+
+        gmsh.model.occ.synchronize()
+        backend_tags = _backend_entity_tags(source_tags)
+        for tag_plans in _group_tag_plans(plan.tags):
+            first_tag = tag_plans[0]
+            entity_tags = _physical_entity_tags(tag_plans, source_tags)
+            if not entity_tags:
+                raise ValueError(
+                    f"{first_tag.physical_name} has no backend entity tags"
+                )
+            group_tag = gmsh.model.addPhysicalGroup(
+                first_tag.dimension,
+                entity_tags,
+            )
+            gmsh.model.setPhysicalName(
+                first_tag.dimension,
+                group_tag,
+                first_tag.physical_name,
+            )
+        gmsh.write(str(xao_path))
+        return replace(
+            plan,
+            backend_entity_tags=backend_tags,
+            metadata={**dict(plan.metadata), "xao_path": str(xao_path)},
+        )
+    finally:
+        if not was_initialized:
+            gmsh.finalize()
 
 
 def _validate_conformal_plan(plan: ConstructionPlanRecord) -> None:
@@ -130,3 +212,79 @@ def _validate_conformal_plan(plan: ConstructionPlanRecord) -> None:
             f"{unpartitioned_volumes!r}. Building these directly would create "
             "standalone surfaces instead of shared conformal topology."
         )
+
+
+def _add_curve_loop_from_plan(
+    gmsh: Any,
+    loop: SurfaceLoopRecord,
+    curve_tags: Mapping[str, int],
+) -> int:
+    signed_curve_tags = [
+        curve_tags[curve_ref.curve_id] * curve_ref.orientation
+        for curve_ref in loop.curve_refs
+    ]
+    return gmsh.model.occ.addCurveLoop(signed_curve_tags)
+
+
+def _volume_surface_tags(
+    volume: Any,
+    source_tags: Mapping[tuple[str, str], Sequence[GmshDimTag]],
+) -> list[int]:
+    tags = [
+        tag
+        for surface_ref in volume.surface_refs
+        for dim, tag in source_tags.get(("surface", surface_ref.surface_id), ())
+        if dim == 2
+    ]
+    if len(tags) != len(volume.surface_refs):
+        missing = [
+            surface_ref.surface_id
+            for surface_ref in volume.surface_refs
+            if not source_tags.get(("surface", surface_ref.surface_id), ())
+        ]
+        raise ValueError(f"{volume.volume_id} missing surface tags: {missing!r}")
+    return tags
+
+
+def _backend_entity_tags(
+    source_tags: Mapping[tuple[str, str], Sequence[GmshDimTag]],
+) -> tuple[BackendEntityTagRecord, ...]:
+    return tuple(
+        BackendEntityTagRecord(
+            source_record_kind=source_kind,
+            source_record_id=source_id,
+            dim_tag=dim_tag,
+        )
+        for (source_kind, source_id), dim_tags in source_tags.items()
+        for dim_tag in dim_tags
+    )
+
+
+def _group_tag_plans(
+    tags: tuple[TagPlanRecord, ...],
+) -> tuple[tuple[TagPlanRecord, ...], ...]:
+    grouped: dict[tuple[str, int, str, str], list[TagPlanRecord]] = {}
+    for tag in tags:
+        grouped.setdefault(
+            (tag.physical_name, tag.dimension, tag.role, tag.solver_use),
+            [],
+        ).append(tag)
+    return tuple(tuple(items) for items in grouped.values())
+
+
+def _physical_entity_tags(
+    tag_plans: tuple[TagPlanRecord, ...],
+    source_tags: Mapping[tuple[str, str], Sequence[GmshDimTag]],
+) -> list[int]:
+    tags: list[int] = []
+    seen: set[int] = set()
+    for tag_plan in tag_plans:
+        for dimension, tag in source_tags.get(
+            (tag_plan.source_record_kind, tag_plan.source_record_id),
+            (),
+        ):
+            if dimension != tag_plan.dimension or tag in seen:
+                continue
+            tags.append(tag)
+            seen.add(tag)
+    return tags

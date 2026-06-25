@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Mapping
+from typing import Any
 
 from semantic_geometry_builder.models import (
     ROUTE_ALLOWED_REPRESENTATIONS,
@@ -389,15 +391,24 @@ def validate_no_surface_overlap(
     surfaces: tuple[SurfacePlanRecord, ...],
 ) -> None:
     """Reject same-plane partial overlap once canonical surfaces are available."""
-    live_surfaces = tuple(
-        surface for surface in surfaces if not surface.construction_only
+    horizontal_surfaces = tuple(
+        (surface, z_um, region)
+        for surface in surfaces
+        if not surface.construction_only
+        for z_um, region in (_horizontal_surface_region(surface),)
+        if region
     )
-    if not live_surfaces:
-        return
-    raise NotImplementedError(
-        "same-plane partial-overlap validation is required before backend "
-        "lowering; exact duplicate checks are not sufficient"
-    )
+    errors: list[str] = []
+    for index, (left, left_z_um, left_region) in enumerate(horizontal_surfaces):
+        for right, right_z_um, right_region in horizontal_surfaces[index + 1 :]:
+            if abs(left_z_um - right_z_um) > 1e-9:
+                continue
+            if _regions_overlap(left_region, right_region):
+                errors.append(
+                    f"{left.surface_id} overlaps {right.surface_id} on z={left_z_um}"
+                )
+    if errors:
+        raise ValueError("Invalid surface overlap: " + "; ".join(errors))
 
 
 def validate_volume_surface_closure(
@@ -653,6 +664,54 @@ def validate_backend_tag_ledger(
             errors.append(f"backend tag {dimtag!r} is shared by sources {sources!r}")
     if errors:
         raise ValueError("Invalid backend tag ledger: " + "; ".join(errors))
+
+
+def _horizontal_surface_region(
+    surface: SurfacePlanRecord,
+) -> tuple[float, tuple[Any, ...]]:
+    geometry_ref = surface.geometry_ref
+    if "outer_loop" not in geometry_ref or "quad_points" in geometry_ref:
+        return 0.0, ()
+    import gdstk
+
+    outer = gdstk.Polygon(_clean_loop2d(geometry_ref["outer_loop"]))
+    holes = tuple(
+        gdstk.Polygon(_clean_loop2d(hole_loop))
+        for hole_loop in geometry_ref.get("hole_loops", ())
+    )
+    if holes:
+        region = tuple(gdstk.boolean((outer,), holes, "not", precision=1e-9) or ())
+    else:
+        region = (outer,)
+    return _geometry_ref_z_um(geometry_ref), region
+
+
+def _regions_overlap(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
+    import gdstk
+
+    overlap = gdstk.boolean(left, right, "and", precision=1e-9) or ()
+    return any(abs(polygon.area()) > 1e-12 for polygon in overlap)
+
+
+def _clean_loop2d(loop: Any) -> tuple[tuple[float, float], ...]:
+    points = tuple((float(point[0]), float(point[1])) for point in loop)
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+    if len(points) < 3:
+        raise ValueError("surface loop requires at least 3 points")
+    return points
+
+
+def _geometry_ref_z_um(geometry_ref: Mapping[str, Any]) -> float:
+    z_min_um = float(geometry_ref.get("z_min_um", geometry_ref.get("z_um", 0.0)))
+    if geometry_ref.get("shell_part") == "top":
+        return z_min_um + float(geometry_ref.get("thickness_um", 0.0))
+    if geometry_ref.get("shell_part") == "bottom":
+        return z_min_um
+    plane = geometry_ref.get("plane") or geometry_ref.get("contact_plane")
+    if isinstance(plane, Mapping) and plane.get("axis") == "z":
+        return float(plane["value_um"])
+    return z_min_um
 
 
 def _surface_signature(surface: SurfacePlanRecord) -> str:

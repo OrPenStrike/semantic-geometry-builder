@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, TypeAlias
 
@@ -160,44 +161,49 @@ def build_gdsfactory_geometry_input(
     layer_stack: LayerStack,
     materials: Mapping[str, Any] | None = None,
     metadata: Mapping[str, Any] | None = None,
+    top_cell_name: str | None = None,
+    work_dir: PathInput | None = None,
+    padding_um: float = 100.0,
 ) -> GeometryBuildInput:
     """Build GeometryBuildInput from GDSFactory layout and technology objects.
 
-    This is a secondary adapter. It should translate GDSFactory `Component`,
-    `LayerStack`, and material records into the same Level 0 semantic stack
-    contract used by `build_gds_stack_geometry_input`, then return the same
-    `GeometryBuildInput` shape. GDSFactory-specific concepts are provenance and
-    convenience inputs, not a separate geometry language for this package.
+    This adapter intentionally lowers GDSFactory/gsim objects into the reviewed
+    Level-0 contract: a GDS file plus stack JSON, then delegates to
+    `build_gds_stack_geometry_input`. The adapter does not invent a second
+    semantic language.
 
-    `component` is expected to be a `gdsfactory.Component`-like object. The
-    adapter uses it only as the layout source: polygons are read per GDS layer
-    or layer name and converted to `LayoutPolygonSpec` records. Component ports,
-    labels, cell names, or instance provenance may be copied into polygon/entity
-    metadata when available, but GDSFactory objects must not leak into the
-    returned IR.
+    `layer_stack` must expose `layers` and `dielectrics` like gsim's
+    `LayerStack`. Only conductor/via layout layers become semantic metal
+    entities in this first slice; solution regions come from `dielectrics`.
+    Missing GDS layer, z-range, material, air/vacuum region, or route
+    representation data fails fast.
 
-    `layer_stack` is expected to be a `gdsfactory.technology.LayerStack`-like
-    object whose `layers` map contains `LayerLevel`-like values. The adapter
-    uses each layer level's layer expression, derived layer, z-position,
-    thickness, material, mesh order, and sidewall/audit fields to assign
-    semantic layer ids, material ids, vertical geometry metadata, and ownership
-    priority for `SemanticEntitySpec` records.
-
-    `materials` optionally maps frontend material names to canonical
-    solver-neutral material metadata. It should refine `material_id` and entity
-    metadata only; solver-specific config belongs downstream.
-
-    `metadata` is copied to `GeometryBuildInput.metadata` for adapter version,
-    source component name, unit convention, or other audit provenance.
-
-    The implementation should return a fully frontend-normalized
-    `GeometryBuildInput`: `polygons` from the component, `entities` from the
-    matched Level 0 stack/material semantics, and selected route metadata only
-    when the frontend data makes it unambiguous. Ambiguous layer/material
-    ownership should fail fast instead of producing heuristic semantic ids.
+    `work_dir` makes the generated GDS and stack JSON reviewable. Without it,
+    temporary files are used only long enough to call the Level-0 adapter.
     """
-    del component, layer_stack, materials, metadata
-    raise NotImplementedError("build_gdsfactory_geometry_input")
+    if materials is not None and not isinstance(materials, Mapping):
+        raise TypeError("materials must be a mapping when provided")
+
+    if work_dir is None:
+        with TemporaryDirectory() as tmp:
+            return _build_gdsfactory_geometry_input_from_dir(
+                component=component,
+                layer_stack=layer_stack,
+                materials=materials,
+                metadata=metadata,
+                top_cell_name=top_cell_name,
+                work_dir=Path(tmp),
+                padding_um=padding_um,
+            )
+    return _build_gdsfactory_geometry_input_from_dir(
+        component=component,
+        layer_stack=layer_stack,
+        materials=materials,
+        metadata=metadata,
+        top_cell_name=top_cell_name,
+        work_dir=Path(work_dir),
+        padding_um=padding_um,
+    )
 
 
 def build_kqcircuits_geometry_input(
@@ -245,6 +251,213 @@ def build_kqcircuits_geometry_input(
     """
     del cell, layer_config, layer_properties, metadata
     raise NotImplementedError("build_kqcircuits_geometry_input")
+
+
+def _build_gdsfactory_geometry_input_from_dir(
+    *,
+    component: Any,
+    layer_stack: Any,
+    materials: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+    top_cell_name: str | None,
+    work_dir: Path,
+    padding_um: float,
+) -> GeometryBuildInput:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    component_name = str(getattr(component, "name", "component") or "component")
+    safe_name = component_name.replace("/", "_").replace(":", "_")
+    gds_path = work_dir / f"{safe_name}.gds"
+    stack_path = work_dir / f"{safe_name}.stack.json"
+
+    write_gds = getattr(component, "write_gds", None)
+    if write_gds is None:
+        raise TypeError("component must provide write_gds(path)")
+    try:
+        write_gds(gds_path)
+    except TypeError:
+        write_gds(str(gds_path))
+
+    stack_mapping = _semantic_stack_mapping_from_layer_stack(
+        layer_stack,
+        materials=materials,
+        source_gds=gds_path,
+        padding_um=padding_um,
+    )
+    stack_path.write_text(
+        json.dumps(stack_mapping, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    return build_gds_stack_geometry_input(
+        gds_file=gds_path,
+        stack_file=stack_path,
+        top_cell_name=top_cell_name or component_name,
+        metadata={
+            **dict(metadata or {}),
+            "adapter": "gdsfactory",
+            "component_name": component_name,
+            "generated_gds_file": str(gds_path),
+            "generated_stack_file": str(stack_path),
+        },
+    )
+
+
+def _semantic_stack_mapping_from_layer_stack(
+    layer_stack: Any,
+    *,
+    materials: Mapping[str, Any] | None,
+    source_gds: Path,
+    padding_um: float,
+) -> dict[str, Any]:
+    layers = getattr(layer_stack, "layers", None)
+    if not isinstance(layers, Mapping):
+        raise TypeError("layer_stack must expose a mapping 'layers'")
+
+    solution_regions = _solution_regions_from_layer_stack(
+        layer_stack,
+        padding_um=padding_um,
+    )
+    host_void_semantic_id = _first_air_like_solution_id(solution_regions)
+    layer_records = [
+        _semantic_layer_record(name, layer, host_void_semantic_id)
+        for name, layer in layers.items()
+        if _layer_type(layer) in {"conductor", "via"}
+    ]
+    if not layer_records:
+        raise ValueError("layer_stack has no conductor/via layers to adapt")
+
+    return {
+        "metadata": {
+            "schema": "semantic_geometry_stack_v1",
+            "units": "um",
+            "source": str(source_gds),
+            "adapter": "gdsfactory",
+            "material_names": sorted(str(key) for key in (materials or {}).keys()),
+        },
+        "solution_regions": solution_regions,
+        "layers": layer_records,
+    }
+
+
+def _solution_regions_from_layer_stack(
+    layer_stack: Any,
+    *,
+    padding_um: float,
+) -> dict[str, Any]:
+    raw_dielectrics = getattr(layer_stack, "dielectrics", None)
+    if not _is_record_sequence(raw_dielectrics):
+        raise TypeError("layer_stack must expose sequence 'dielectrics'")
+
+    regions: dict[str, Any] = {}
+    for index, raw in enumerate(raw_dielectrics):
+        if not isinstance(raw, Mapping):
+            raise TypeError("layer_stack.dielectrics items must be mappings")
+        material_id = str(raw.get("material") or raw.get("material_id") or "")
+        if not material_id:
+            raise ValueError("dielectric records must define material")
+        semantic_id = str(raw.get("name") or raw.get("domain") or material_id or index)
+        z_min = raw.get("zmin", raw.get("z_min_um"))
+        z_max = raw.get("zmax", raw.get("z_max_um"))
+        if z_min is None or z_max is None:
+            raise ValueError(f"solution region {semantic_id!r} needs zmin/zmax")
+        regions[semantic_id] = {
+            "role": "solution_region",
+            "material_id": material_id,
+            "geometry_kind": "domain",
+            "geometry": {
+                "domain": semantic_id,
+                "padding_um": padding_um,
+                "z_min_um": float(z_min),
+                "z_max_um": float(z_max),
+            },
+        }
+    return regions
+
+
+def _semantic_layer_record(
+    name: Any,
+    layer: Any,
+    host_void_semantic_id: str,
+) -> dict[str, Any]:
+    gds_layer = _gds_layer_tuple(layer)
+    layer_type = _layer_type(layer)
+    z_min = getattr(layer, "zmin", None)
+    thickness = getattr(layer, "thickness", None)
+    material_id = str(getattr(layer, "material", "") or "")
+    if z_min is None or thickness is None:
+        raise ValueError(f"layer {name!r} needs zmin/thickness")
+    if not material_id:
+        raise ValueError(f"layer {name!r} needs material")
+
+    semantic_id = str(name)
+    is_via = layer_type == "via"
+    return {
+        "layer": gds_layer[0],
+        "datatype": gds_layer[1],
+        "semantic_id": semantic_id,
+        "role": "metal",
+        "material_id": material_id,
+        "priority": int(getattr(layer, "mesh_order", 0) or 0),
+        "part_role": "bump_body" if is_via else "face_metal",
+        "net_id": semantic_id,
+        "geometry_kind": "layout_extrusion",
+        "host_void_semantic_id": host_void_semantic_id,
+        "geometry": {
+            "z_um": float(z_min),
+            "thickness_um": float(thickness),
+            "geometry_source": "gds_polygon",
+        },
+        "route_representations": (
+            {
+                "A": "cutout_boundary_shell",
+                "B": "cutout_boundary_shell",
+                "C": "material_volume",
+            }
+            if is_via
+            else {
+                "A": "surface_sheet",
+                "B": "cutout_boundary_shell",
+                "C": "material_volume",
+            }
+        ),
+        "metadata": {
+            "source_layer_name": semantic_id,
+            "source_layer_type": layer_type,
+        },
+    }
+
+
+def _gds_layer_tuple(layer: Any) -> tuple[int, int]:
+    value = getattr(layer, "gds_layer", None)
+    if value is None:
+        value = getattr(layer, "layer", None)
+    if (
+        isinstance(value, Sequence)
+        and not isinstance(value, str | bytes)
+        and len(value) == 2
+    ):
+        return int(value[0]), int(value[1])
+    raise ValueError("layer must define gds_layer as a 2-item tuple")
+
+
+def _layer_type(layer: Any) -> str:
+    value = getattr(layer, "layer_type", None)
+    if value is None:
+        info = getattr(layer, "info", None)
+        if isinstance(info, Mapping):
+            value = info.get("layer_type")
+    if value is None:
+        raise ValueError("layer must define layer_type")
+    return str(value)
+
+
+def _first_air_like_solution_id(solution_regions: Mapping[str, Any]) -> str:
+    for semantic_id, record in solution_regions.items():
+        material = str(record.get("material_id", "")).lower()
+        name = str(semantic_id).lower()
+        if any(token in f"{name} {material}" for token in ("air", "vacuum")):
+            return str(semantic_id)
+    raise ValueError("layer_stack dielectrics must include an air/vacuum region")
 
 
 def _load_stack_mapping(
@@ -603,7 +816,7 @@ def _route_a_sheet_interfaces(
                     "interface_id": f"MA__{entity.semantic_id}__AIR__{index:04d}",
                     "kind": "MA",
                     "owner_semantic_ids": (entity.semantic_id, "AIR"),
-                    "interface_kinds": ("MA", "SA"),
+                    "interface_kinds": ("MS", "MA"),
                     "recognition_rule": "route_a_surface_sheet_polygon",
                     "source_polygon_ids": (polygon_id,),
                     "valid_routes": ("A",),
