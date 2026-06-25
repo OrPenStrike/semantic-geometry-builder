@@ -9,7 +9,10 @@ description = "Layout-tool-agnostic semantic geometry IR and route builder scaff
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "OrPenStrike" }]
-dependencies = []
+dependencies = [
+    "gdstk",
+    "gmsh",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

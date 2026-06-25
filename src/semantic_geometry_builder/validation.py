@@ -175,7 +175,9 @@ def validate_route_volume_surface_refs(
     missing = sorted(
         volume.volume_id
         for volume in volumes
-        if not volume.surface_refs
+        if volume.metadata.get("representation") == "material_volume"
+        and not volume.surface_refs
+        and "geometry_ref" not in volume.metadata
     )
     if missing:
         raise ValueError(
@@ -334,5 +336,4 @@ def _requires_route_representation(entity: SemanticEntitySpec) -> bool:
         return True
     role_tokens = set(str(entity.role).lower().replace("_", " ").split())
     return bool(role_tokens & {"metal", "conductor"})
-
 

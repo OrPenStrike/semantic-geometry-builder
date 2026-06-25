@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 
 from semantic_geometry_builder.models import (
     GeometryBuildInput,
+    LayoutPolygonSpec,
     PathInput,
     SemanticEntitySpec,
 )
@@ -78,9 +79,10 @@ def build_gds_stack_geometry_input(
     resolved stack-file material semantics, and `solution_regions` from
     solver-domain definitions such as AIR, substrate, dielectric, or enclosure
     boxes. It must not emit solver config or assume Ansys physical names are the
-    final semantic ids. Until real polygon extraction exists, this function
-    fails fast instead of returning an empty fake IR.
+    final semantic ids.
     """
+    import gdstk
+
     gds_path = Path(gds_file)
     if not gds_path.is_file():
         raise FileNotFoundError(gds_path)
@@ -100,15 +102,55 @@ def build_gds_stack_geometry_input(
     if metadata is not None and not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping when provided")
 
-    tuple(
-        _solution_region_entity_from_record(semantic_id, record)
+    library = gdstk.read_gds(str(gds_path))
+    cell = _select_gds_cell(library, top_cell_name)
+    cell_bounds = _cell_bounds_um(cell)
+    polygons_by_layer = _polygons_by_layer(cell)
+
+    polygons: list[LayoutPolygonSpec] = []
+    entities: list[SemanticEntitySpec] = [
+        _solution_region_entity_from_record(
+            semantic_id,
+            record,
+            cell_bounds_um=cell_bounds,
+        )
         for semantic_id, record in solution_regions.items()
+    ]
+    domain_bounds_by_semantic_id = {
+        entity.semantic_id: entity.geometry["domain_bounds_um"]
+        for entity in entities
+        if isinstance(entity.geometry.get("domain_bounds_um"), Mapping)
+    }
+
+    for record in raw_layers:
+        entity, entity_polygons = _entity_and_polygons_from_layer_record(
+            record,
+            polygons_by_layer=polygons_by_layer,
+            cell_bounds_um=cell_bounds,
+            domain_bounds_by_semantic_id=domain_bounds_by_semantic_id,
+        )
+        polygons.extend(entity_polygons)
+        entities.append(entity)
+
+    combined_metadata = {
+        **dict(stack_metadata),
+        **dict(metadata or {}),
+        "adapter": "gds_stack",
+        "gds_file": str(gds_path),
+        "stack_file": str(stack_path),
+        "selected_cell_name": cell.name,
+        "cell_bounds_um": cell_bounds,
+    }
+    combined_metadata["interface_intents_2d"] = _route_a_sheet_interfaces(
+        entities,
+        polygons,
     )
-    tuple(_entity_from_layer_record(record) for record in raw_layers)
-    del stack_path, stack_metadata, top_cell_name
-    raise NotImplementedError(
-        "build_gds_stack_geometry_input requires real GDS polygon extraction; "
-        "empty GeometryBuildInput.polygons is not a valid compiler input"
+
+    return GeometryBuildInput(
+        polygons=tuple(polygons),
+        entities=tuple(entities),
+        solution_regions=dict(solution_regions),
+        metadata=combined_metadata,
     )
 
 
@@ -227,9 +269,64 @@ def _is_record_sequence(value: Any) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, str | bytes)
 
 
+def _select_gds_cell(library: Any, top_cell_name: str | None) -> Any:
+    if top_cell_name is not None:
+        for cell in library.cells:
+            if cell.name == top_cell_name:
+                return cell
+        raise ValueError(f"GDS top_cell_name not found: {top_cell_name!r}")
+
+    candidates = [
+        cell
+        for cell in library.cells
+        if cell.name != "$$$CONTEXT_INFO$$$"
+        and cell.get_polygons(apply_repetitions=True)
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        names = ", ".join(sorted(cell.name for cell in candidates))
+        raise ValueError(f"top_cell_name is required; candidates: {names}")
+
+    top_cells = [
+        cell
+        for cell in library.top_level()
+        if cell.get_polygons(apply_repetitions=True)
+    ]
+    if len(top_cells) == 1:
+        return top_cells[0]
+    names = ", ".join(sorted(cell.name for cell in top_cells))
+    raise ValueError(f"top_cell_name is required; candidates: {names}")
+
+
+def _cell_bounds_um(cell: Any) -> dict[str, float]:
+    bbox = cell.bounding_box()
+    if bbox is None:
+        raise ValueError(f"GDS cell {cell.name!r} has no bounding box")
+    (x_min, y_min), (x_max, y_max) = bbox
+    return {
+        "x_min_um": float(x_min),
+        "y_min_um": float(y_min),
+        "x_max_um": float(x_max),
+        "y_max_um": float(y_max),
+    }
+
+
+def _polygons_by_layer(cell: Any) -> dict[tuple[int, int], tuple[Any, ...]]:
+    result: dict[tuple[int, int], list[Any]] = {}
+    for polygon in cell.get_polygons(apply_repetitions=True):
+        result.setdefault(
+            (int(polygon.layer), int(polygon.datatype)),
+            [],
+        ).append(polygon)
+    return {key: tuple(value) for key, value in result.items()}
+
+
 def _solution_region_entity_from_record(
     semantic_id: Any,
     record: Any,
+    *,
+    cell_bounds_um: Mapping[str, float],
 ) -> SemanticEntitySpec:
     if not isinstance(semantic_id, str):
         raise TypeError("solution region ids must be strings")
@@ -240,6 +337,18 @@ def _solution_region_entity_from_record(
     if not isinstance(geometry, Mapping):
         raise TypeError("solution region 'geometry' must be a mapping")
 
+    geometry = dict(geometry)
+    padding_um = float(geometry.get("padding_um", 0.0))
+    geometry.setdefault(
+        "domain_bounds_um",
+        {
+            "x_min_um": cell_bounds_um["x_min_um"] - padding_um,
+            "y_min_um": cell_bounds_um["y_min_um"] - padding_um,
+            "x_max_um": cell_bounds_um["x_max_um"] + padding_um,
+            "y_max_um": cell_bounds_um["y_max_um"] + padding_um,
+        },
+    )
+
     return SemanticEntitySpec(
         semantic_id=semantic_id,
         role=record.get("role", "solution_region"),
@@ -249,6 +358,34 @@ def _solution_region_entity_from_record(
         geometry=geometry,
         metadata=record.get("metadata", {}),
     )
+
+
+def _entity_and_polygons_from_layer_record(
+    record: Any,
+    *,
+    polygons_by_layer: Mapping[tuple[int, int], tuple[Any, ...]],
+    cell_bounds_um: Mapping[str, float],
+    domain_bounds_by_semantic_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[SemanticEntitySpec, tuple[LayoutPolygonSpec, ...]]:
+    entity = _entity_from_layer_record(record)
+    geometry_source = str(entity.geometry.get("geometry_source", "gds_polygon"))
+    if geometry_source == "die_face_minus_ground_mask":
+        entity_polygons = _derived_ground_polygons(
+            entity,
+            polygons_by_layer=polygons_by_layer,
+            cell_bounds_um=cell_bounds_um,
+            domain_bounds_by_semantic_id=domain_bounds_by_semantic_id,
+        )
+    elif geometry_source == "gds_polygon":
+        entity_polygons = _gds_polygons_for_entity(
+            entity,
+            polygons_by_layer=polygons_by_layer,
+        )
+    else:
+        entity_polygons = ()
+
+    entity = _entity_with_polygon_geometry(entity, entity_polygons)
+    return entity, entity_polygons
 
 
 def _entity_from_layer_record(record: Any) -> SemanticEntitySpec:
@@ -313,3 +450,202 @@ def _entity_from_layer_record(record: Any) -> SemanticEntitySpec:
         geometry=geometry,
         metadata=record.get("metadata", {}),
     )
+
+
+def _gds_polygons_for_entity(
+    entity: SemanticEntitySpec,
+    *,
+    polygons_by_layer: Mapping[tuple[int, int], tuple[Any, ...]],
+) -> tuple[LayoutPolygonSpec, ...]:
+    layer = int(entity.geometry["gds_layer"])
+    datatype = int(entity.geometry["gds_datatype"])
+    candidates = polygons_by_layer.get((layer, datatype), ())
+    if not candidates:
+        return ()
+
+    selector = entity.geometry.get("selector_point_um")
+    if selector is not None:
+        selected = [
+            polygon
+            for polygon in candidates
+            if _point_in_ring(
+                (float(selector[0]), float(selector[1])),
+                _ring_from_gdstk_polygon(polygon),
+            )
+        ]
+        if len(selected) != 1:
+            raise ValueError(
+                f"{entity.semantic_id} selector_point_um matched "
+                f"{len(selected)} polygons"
+            )
+    else:
+        selected = list(candidates)
+
+    return tuple(
+        LayoutPolygonSpec(
+            polygon_id=f"{entity.semantic_id}__P{index:04d}",
+            layer=f"{layer}/{datatype}",
+            exterior=_ring_from_gdstk_polygon(polygon),
+            object_name=entity.semantic_id,
+            net_name=entity.net_id,
+            metadata={
+                "gds_layer": layer,
+                "gds_datatype": datatype,
+                "source": "gds_polygon",
+            },
+        )
+        for index, polygon in enumerate(selected)
+    )
+
+
+def _derived_ground_polygons(
+    entity: SemanticEntitySpec,
+    *,
+    polygons_by_layer: Mapping[tuple[int, int], tuple[Any, ...]],
+    cell_bounds_um: Mapping[str, float],
+    domain_bounds_by_semantic_id: Mapping[str, Mapping[str, Any]],
+) -> tuple[LayoutPolygonSpec, ...]:
+    mask_layer = entity.geometry.get("mask_layer")
+    if mask_layer is None:
+        mask_key = (
+            int(entity.geometry["gds_layer"]),
+            int(entity.geometry["gds_datatype"]),
+        )
+    else:
+        mask_key = (int(mask_layer[0]), int(mask_layer[1]))
+    holes = tuple(
+        _ring_from_gdstk_polygon(polygon)
+        for polygon in polygons_by_layer.get(mask_key, ())
+    )
+    exterior = _rectangle_ring(
+        _ground_plane_bounds(entity, domain_bounds_by_semantic_id, cell_bounds_um)
+    )
+    return (
+        LayoutPolygonSpec(
+            polygon_id=f"{entity.semantic_id}__P0000",
+            layer=f"{mask_key[0]}/{mask_key[1]}",
+            exterior=exterior,
+            holes=holes,
+            object_name=entity.semantic_id,
+            net_name=entity.net_id,
+            metadata={
+                "gds_layer": mask_key[0],
+                "gds_datatype": mask_key[1],
+                "source": "die_face_minus_ground_mask",
+            },
+        ),
+    )
+
+
+def _ground_plane_bounds(
+    entity: SemanticEntitySpec,
+    domain_bounds_by_semantic_id: Mapping[str, Mapping[str, Any]],
+    cell_bounds_um: Mapping[str, float],
+) -> Mapping[str, Any]:
+    plane_bounds_ref = entity.geometry.get("plane_bounds_ref")
+    if plane_bounds_ref is None:
+        return cell_bounds_um
+    if not isinstance(plane_bounds_ref, str):
+        raise TypeError(f"{entity.semantic_id} plane_bounds_ref must be a string")
+    try:
+        return domain_bounds_by_semantic_id[plane_bounds_ref]
+    except KeyError as exc:
+        raise ValueError(
+            f"{entity.semantic_id} plane_bounds_ref {plane_bounds_ref!r} "
+            "does not match a solution region"
+        ) from exc
+
+
+def _entity_with_polygon_geometry(
+    entity: SemanticEntitySpec,
+    polygons: tuple[LayoutPolygonSpec, ...],
+) -> SemanticEntitySpec:
+    if not polygons:
+        return entity
+    geometry = dict(entity.geometry)
+    if len(polygons) == 1:
+        geometry.setdefault("outer_loop", polygons[0].exterior)
+        geometry.setdefault("hole_loops", polygons[0].holes)
+    polygon_ids = tuple(polygon.polygon_id for polygon in polygons)
+    return SemanticEntitySpec(
+        semantic_id=entity.semantic_id,
+        role=entity.role,
+        material_id=entity.material_id,
+        priority=entity.priority,
+        geometry_kind=entity.geometry_kind,
+        part_role=entity.part_role,
+        attached_face_metal_semantic_id=entity.attached_face_metal_semantic_id,
+        net_id=entity.net_id,
+        polygon_ids=polygon_ids,
+        labels=entity.labels,
+        host_void_semantic_id=entity.host_void_semantic_id,
+        requires_construction_body=entity.requires_construction_body,
+        route_representations=entity.route_representations,
+        geometry=geometry,
+        metadata=entity.metadata,
+    )
+
+
+def _route_a_sheet_interfaces(
+    entities: Sequence[SemanticEntitySpec],
+    polygons: Sequence[LayoutPolygonSpec],
+) -> dict[str, tuple[Mapping[str, Any], ...]]:
+    polygons_by_id = {polygon.polygon_id: polygon for polygon in polygons}
+    interfaces: list[Mapping[str, Any]] = []
+    for entity in entities:
+        if entity.route_representations.get("A") != "surface_sheet":
+            continue
+        for index, polygon_id in enumerate(entity.polygon_ids):
+            polygon = polygons_by_id[polygon_id]
+            z_um = float(entity.geometry.get("z_um", 0.0))
+            interfaces.append(
+                {
+                    "interface_id": f"MA__{entity.semantic_id}__AIR__{index:04d}",
+                    "kind": "MA",
+                    "owner_semantic_ids": (entity.semantic_id, "AIR"),
+                    "interface_kinds": ("MA", "SA"),
+                    "recognition_rule": "route_a_surface_sheet_polygon",
+                    "source_polygon_ids": (polygon_id,),
+                    "valid_routes": ("A",),
+                    "plane": {"axis": "z", "value_um": z_um},
+                    "outer_loop": polygon.exterior,
+                    "hole_loops": polygon.holes,
+                }
+            )
+    return {"interfaces": tuple(interfaces)}
+
+
+def _ring_from_gdstk_polygon(polygon: Any) -> tuple[tuple[float, float], ...]:
+    points = tuple((float(x), float(y)) for x, y in polygon.points)
+    if len(points) > 1 and points[0] == points[-1]:
+        points = points[:-1]
+    if len(points) < 3:
+        raise ValueError("GDS polygon requires at least 3 unique points")
+    return points
+
+
+def _rectangle_ring(bounds: Mapping[str, float]) -> tuple[tuple[float, float], ...]:
+    return (
+        (float(bounds["x_min_um"]), float(bounds["y_min_um"])),
+        (float(bounds["x_max_um"]), float(bounds["y_min_um"])),
+        (float(bounds["x_max_um"]), float(bounds["y_max_um"])),
+        (float(bounds["x_min_um"]), float(bounds["y_max_um"])),
+    )
+
+
+def _point_in_ring(
+    point: tuple[float, float],
+    ring: Sequence[tuple[float, float]],
+) -> bool:
+    x, y = point
+    inside = False
+    j = len(ring) - 1
+    for i, (xi, yi) in enumerate(ring):
+        xj, yj = ring[j]
+        crosses = (yi > y) != (yj > y)
+        if crosses:
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_intersect:
+                inside = not inside
+        j = i
+    return inside

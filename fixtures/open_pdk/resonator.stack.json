@@ -74,6 +74,7 @@
         "z_um": 0.0,
         "thickness_um": 0.2,
         "geometry_source": "die_face_minus_ground_mask",
+        "plane_bounds_ref": "D0_Substrate",
         "mask_layer": [110, 0]
       },
       "route_representations": {

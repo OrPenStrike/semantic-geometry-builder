@@ -2,7 +2,7 @@
   "metadata": {
     "schema": "semantic_geometry_stack_v1",
     "units": "um",
-    "source": "fixtures/open_pdk/martinis2022_ribbon.gds"
+    "source": "tutorials/assets/martinis2022_ribbon.gds"
   },
   "solution_regions": {
     "AIR": {

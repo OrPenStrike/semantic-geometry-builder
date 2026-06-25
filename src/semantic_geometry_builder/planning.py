@@ -63,6 +63,8 @@ _GEOMETRY_REF_METADATA_KEYS = (
     "hole_loops",
     "loop_geometry_ref",
     "inset_band",
+    "z_um",
+    "thickness_um",
 )
 _INTERFACE_KIND_ORDER = ("MM", "SS", "AA", "MS", "MA", "SA")
 
@@ -157,12 +159,13 @@ def recognize_route_interfaces(
     through `interface_intents_2d`, including generic `interfaces` entries with
     explicit `kind`.
     """
-    del route
     intents = dict(build_input.metadata.get("interface_intents_2d", {}))
     records: list[InterfacePlanRecord] = []
     for index, intent in enumerate(intents.get("interfaces", ())):
         if not isinstance(intent, Mapping):
             raise ValueError("interfaces entries must be mappings")
+        if not _intent_supports_route(intent, route):
+            continue
         kind = str(intent.get("kind", ""))
         if kind not in _INTERFACE_KIND_ORDER:
             raise ValueError(f"invalid interface kind: {kind!r}")
@@ -187,6 +190,8 @@ def recognize_route_interfaces(
     for index, intent in enumerate(intents.get("metal_metal_contact_edges", ())):
         if not isinstance(intent, Mapping):
             raise ValueError("metal_metal_contact_edges entries must be mappings")
+        if not _intent_supports_route(intent, route):
+            continue
         owners = tuple(str(owner) for owner in intent.get("owner_semantic_ids", ()))
         if len(owners) != 2:
             raise ValueError(f"invalid MM edge intent owners: {intent!r}")
@@ -207,6 +212,8 @@ def recognize_route_interfaces(
     for index, intent in enumerate(intents.get("metal_ground_contact_patches", ())):
         if not isinstance(intent, Mapping):
             raise ValueError("metal_ground_contact_patches entries must be mappings")
+        if not _intent_supports_route(intent, route):
+            continue
         owners = tuple(str(owner) for owner in intent.get("owner_semantic_ids", ()))
         if len(owners) != 2:
             raise ValueError(f"invalid contact patch intent owners: {intent!r}")
@@ -332,7 +339,6 @@ def plan_route_construction_bodies(
             continue
 
         host_id = entity.host_void_semantic_id or default_host
-        surface_id = f"SURF__{route}__SHELL__{entity.semantic_id}"
         records.append(
             ConstructionBodyPlanRecord(
                 construction_body_id=f"CBODY__{route}__{entity.semantic_id}",
@@ -343,7 +349,7 @@ def plan_route_construction_bodies(
                     entity,
                     representation=representation,
                 ),
-                expected_surface_ids=(surface_id,),
+                expected_surface_ids=_cutout_shell_surface_ids(route, entity),
                 valid_routes=(route,),
             )
         )
@@ -380,6 +386,7 @@ def plan_route_surfaces(
         ).append(partition)
 
     records: list[SurfacePlanRecord] = []
+    records.extend(_plan_substrate_air_surfaces(build_input, route=route))
     for interface in interfaces:
         geometry_ref = {
             "from_interface_id": interface.interface_id,
@@ -434,31 +441,53 @@ def plan_route_surfaces(
         for body in construction_bodies
         for surface_id in body.expected_surface_ids
     }
+    default_host = _default_host_solution_id(build_input)
+    default_substrate = _default_substrate_solution_id(build_input)
     for entity in build_input.entities:
         if _is_solution_entity(entity):
             continue
         representation = entity.route_representations.get(route)
         if representation == "cutout_boundary_shell":
-            surface_id = f"SURF__{route}__SHELL__{entity.semantic_id}"
-            body = construction_body_by_surface_id.get(surface_id)
-            records.append(
-                SurfacePlanRecord(
-                    surface_id=surface_id,
-                    owner_semantic_id=entity.semantic_id,
-                    surface_role="cutout_boundary_shell",
-                    geometry_ref={
-                        **_entity_geometry_ref(
-                            entity,
-                            representation=representation,
+            for shell_part, interface_kind, adjacent_id in (
+                ("top", "MA", default_host),
+                ("bottom", "MS", default_substrate),
+                ("sidewall", "MA", default_host),
+            ):
+                surface_id = _cutout_shell_surface_id(route, entity, shell_part)
+                body = construction_body_by_surface_id.get(surface_id)
+                records.append(
+                    SurfacePlanRecord(
+                        surface_id=surface_id,
+                        owner_semantic_id=entity.semantic_id,
+                        surface_role="cutout_boundary_shell",
+                        geometry_ref={
+                            **_entity_geometry_ref(
+                                entity,
+                                representation=representation,
+                            ),
+                            "shell_part": shell_part,
+                            "construction_body_id": (
+                                body.construction_body_id
+                                if body is not None
+                                else None
+                            ),
+                        },
+                        interface_id=(
+                            f"{interface_kind}__{entity.semantic_id}__"
+                            f"{adjacent_id}__{shell_part.upper()}"
                         ),
-                        "construction_body_id": (
-                            body.construction_body_id if body is not None else None
-                        ),
-                    },
-                    valid_routes=(route,),
-                    solver_use="solver_active",
+                        valid_routes=(route,),
+                        solver_use="solver_active",
+                        metadata={
+                            "interface_kinds": (interface_kind,),
+                            "owner_semantic_ids": (
+                                entity.semantic_id,
+                                adjacent_id,
+                            ),
+                            "exposed_surface_role": shell_part,
+                        },
+                    )
                 )
-            )
     return tuple(records)
 
 
@@ -485,6 +514,19 @@ def plan_route_volumes(
     records: list[VolumePlanRecord] = []
     for entity in build_input.entities:
         if _is_solution_entity(entity):
+            records.append(
+                VolumePlanRecord(
+                    volume_id=f"VOL__{entity.semantic_id}",
+                    owner_semantic_id=entity.semantic_id,
+                    material_id=entity.material_id,
+                    surface_refs=(),
+                    valid_routes=(route,),
+                    metadata={
+                        "representation": "solution_volume",
+                        "geometry_ref": dict(entity.geometry),
+                    },
+                )
+            )
             continue
         representation = entity.route_representations.get(route)
         if route == "C" and representation == "material_volume":
@@ -505,7 +547,13 @@ def plan_route_volumes(
                         )
                     ),
                     valid_routes=(route,),
-                    metadata={"representation": representation},
+                    metadata={
+                        "representation": representation,
+                        "geometry_ref": _entity_geometry_ref(
+                            entity,
+                            representation=representation,
+                        ),
+                    },
                 )
             )
     return tuple(records)
@@ -589,6 +637,15 @@ def _geometry_ref_from_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _intent_supports_route(intent: Mapping[str, Any], route: RouteLiteral) -> bool:
+    valid_routes = intent.get("valid_routes")
+    if valid_routes is None:
+        return True
+    if isinstance(valid_routes, str):
+        return route == valid_routes
+    return route in {str(value) for value in valid_routes}
+
+
 def _interface_kinds(interface: InterfacePlanRecord) -> tuple[str, ...]:
     raw = interface.metadata.get("interface_kinds", (interface.kind,))
     if isinstance(raw, str):
@@ -611,9 +668,159 @@ def _surface_physical_name(surface: SurfacePlanRecord) -> str:
         kinds = tuple(str(kind) for kind in raw)
     else:
         kinds = ()
-    if not kinds:
-        return surface.surface_id
-    return f"{'_'.join(kinds)}__{surface.surface_id}"
+    kind_prefix = "_".join(kinds)
+    if surface.interface_id is not None:
+        parts = surface.interface_id.split("__")
+        if parts and parts[0] in _INTERFACE_KIND_ORDER:
+            return "__".join((kind_prefix or parts[0], *parts[1:]))
+        return surface.interface_id
+    if kind_prefix:
+        owner_ids = surface.metadata.get(
+            "owner_semantic_ids",
+            (surface.owner_semantic_id,),
+        )
+        if isinstance(owner_ids, str):
+            owner_ids = (owner_ids,)
+        suffix = surface.metadata.get("exposed_surface_role")
+        parts = [kind_prefix, *(str(owner_id) for owner_id in owner_ids)]
+        if suffix:
+            parts.append(str(suffix).upper())
+        return "__".join(parts)
+    return surface.surface_id.removeprefix("SURF__")
+
+
+def _plan_substrate_air_surfaces(
+    build_input: GeometryBuildInput,
+    *,
+    route: RouteLiteral,
+) -> tuple[SurfacePlanRecord, ...]:
+    substrate = _entity_by_id(build_input, _default_substrate_solution_id(build_input))
+    air_id = _default_host_solution_id(build_input)
+    substrate_bounds = substrate.geometry.get("domain_bounds_um")
+    if not isinstance(substrate_bounds, Mapping):
+        return ()
+
+    conductor_entities = [
+        entity
+        for entity in build_input.entities
+        if not _is_solution_entity(entity)
+        and entity.route_representations.get(route) is not None
+        and "outer_loop" in entity.geometry
+    ]
+    derived_ground_entities = [
+        entity
+        for entity in conductor_entities
+        if entity.geometry.get("geometry_source") == "die_face_minus_ground_mask"
+    ]
+    if derived_ground_entities:
+        base_loops = tuple(
+            loop
+            for entity in derived_ground_entities
+            for loop in entity.geometry.get("hole_loops", ())
+        )
+        hole_entities = [
+            entity
+            for entity in conductor_entities
+            if entity not in derived_ground_entities
+        ]
+    else:
+        base_loops = (_domain_bounds_loop(substrate_bounds),)
+        hole_entities = conductor_entities
+
+    z_um = float(substrate.geometry.get("z_max_um", 0.0))
+    records: list[SurfacePlanRecord] = []
+    for index, outer_loop in enumerate(base_loops):
+        hole_loops = tuple(
+            entity.geometry["outer_loop"]
+            for entity in hole_entities
+            if _loop_inside_loop(entity.geometry["outer_loop"], outer_loop)
+        )
+        interface_id = f"SA__{substrate.semantic_id}__{air_id}__{index:04d}"
+        records.append(
+            SurfacePlanRecord(
+                surface_id=f"SURF__{interface_id}",
+                owner_semantic_id=substrate.semantic_id,
+                surface_role="solution_interface",
+                geometry_ref={
+                    "plane": {"axis": "z", "value_um": z_um},
+                    "outer_loop": outer_loop,
+                    "hole_loops": hole_loops,
+                },
+                interface_id=interface_id,
+                valid_routes=(route,),
+                solver_use="solver_active",
+                metadata={
+                    "interface_kinds": ("SA",),
+                    "owner_semantic_ids": (substrate.semantic_id, air_id),
+                },
+            )
+        )
+    return tuple(records)
+
+
+def _cutout_shell_surface_ids(
+    route: RouteLiteral,
+    entity: SemanticEntitySpec,
+) -> tuple[str, ...]:
+    return tuple(
+        _cutout_shell_surface_id(route, entity, shell_part)
+        for shell_part in ("top", "bottom", "sidewall")
+    )
+
+
+def _cutout_shell_surface_id(
+    route: RouteLiteral,
+    entity: SemanticEntitySpec,
+    shell_part: str,
+) -> str:
+    return f"SURF__{route}__SHELL__{entity.semantic_id}__{shell_part.upper()}"
+
+
+def _entity_by_id(
+    build_input: GeometryBuildInput,
+    semantic_id: str,
+) -> SemanticEntitySpec:
+    for entity in build_input.entities:
+        if entity.semantic_id == semantic_id:
+            return entity
+    raise ValueError(f"unknown semantic entity: {semantic_id}")
+
+
+def _domain_bounds_loop(bounds: Mapping[str, Any]) -> tuple[tuple[float, float], ...]:
+    return (
+        (float(bounds["x_min_um"]), float(bounds["y_min_um"])),
+        (float(bounds["x_max_um"]), float(bounds["y_min_um"])),
+        (float(bounds["x_max_um"]), float(bounds["y_max_um"])),
+        (float(bounds["x_min_um"]), float(bounds["y_max_um"])),
+    )
+
+
+def _loop_inside_loop(loop: Any, container: Any) -> bool:
+    x, y = _loop_centroid(loop)
+    return _point_in_loop((x, y), container)
+
+
+def _loop_centroid(loop: Any) -> tuple[float, float]:
+    points = tuple((float(point[0]), float(point[1])) for point in loop)
+    return (
+        sum(point[0] for point in points) / len(points),
+        sum(point[1] for point in points) / len(points),
+    )
+
+
+def _point_in_loop(point: tuple[float, float], loop: Any) -> bool:
+    x, y = point
+    points = tuple((float(item[0]), float(item[1])) for item in loop)
+    inside = False
+    previous = len(points) - 1
+    for index, (xi, yi) in enumerate(points):
+        xj, yj = points[previous]
+        if (yi > y) != (yj > y):
+            x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_intersect:
+                inside = not inside
+        previous = index
+    return inside
 
 
 def _entity_geometry_ref(
@@ -641,3 +848,17 @@ def _default_host_solution_id(build_input: GeometryBuildInput) -> str:
             return entity.semantic_id
     raise ValueError("GeometryBuildInput requires an air/vacuum host solution entity")
 
+
+def _default_substrate_solution_id(build_input: GeometryBuildInput) -> str:
+    for entity in build_input.entities:
+        if not _is_solution_entity(entity):
+            continue
+        tokens = {
+            entity.semantic_id.lower(),
+            entity.role.lower(),
+            entity.material_id.lower(),
+            entity.geometry_kind.lower(),
+        }
+        if any("substrate" in token for token in tokens):
+            return entity.semantic_id
+    raise ValueError("GeometryBuildInput requires a substrate solution entity")
