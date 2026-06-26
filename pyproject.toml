@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "semantic-geometry-builder"
 version = "0.1.0"
-description = "Layout-tool-agnostic semantic geometry IR and route builder scaffold."
+description = "Layout-tool-agnostic semantic geometry compiler and route builder."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "OrPenStrike" }]

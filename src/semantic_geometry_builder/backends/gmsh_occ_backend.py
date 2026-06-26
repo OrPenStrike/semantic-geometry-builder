@@ -1,22 +1,25 @@
-"""Gmsh/OpenCASCADE bottom-up construction backend scaffold.
+"""Gmsh/OpenCASCADE bottom-up construction backend.
 
 This backend consumes `ConstructionPlanRecord`. It must not discover interfaces
 by running global `occ.fragment()` over arbitrary volumes.
 
-Expected implementation shape:
+Implemented lowering shape:
 
 1. consume planned canonical curves/surface loops and create live surfaces;
-2. create Route A/B construction bodies only for `ConstructionBodyPlanRecord`;
-3. execute `CutHostOperationRecord` plans and recover exposed shell surfaces;
-4. reuse the same surface tag for planned conformal interfaces;
-5. assemble every backend-live volume with `occ.addSurfaceLoop()` and
+2. reuse the same surface tag for planned conformal interfaces;
+3. assemble every backend-live volume with `occ.addSurfaceLoop()` and
    `occ.addVolume()`;
-6. recover backend dim-tags by `SurfacePlanRecord.surface_id` and
+4. recover backend dim-tags by `SurfacePlanRecord.surface_id` and
    `VolumePlanRecord.volume_id`;
-7. write those tags to `BackendEntityTagRecord`;
-8. attach physical groups only from `TagPlanRecord`;
-9. write XAO/metadata with the same stable source ids;
-10. fail when the plan cannot be built conformally.
+5. write those tags to `BackendEntityTagRecord`;
+6. attach physical groups only from `TagPlanRecord`;
+7. write XAO/metadata with the same stable source ids;
+8. fail when the plan cannot be built conformally.
+
+`ConstructionBodyPlanRecord` and `CutHostOperationRecord` are route-policy
+provenance in the current v1 path. They explain why cutout-shell surfaces exist
+and how host interiors should be excluded, but this backend does not run
+boolean cutter batches or use them to discover new surfaces.
 
 Concrete Gmsh/OCC lowering target:
 
@@ -54,8 +57,8 @@ OCC backend comment block:
 
 - `SurfacePlanRecord.outer_loop_ref` and `hole_loop_refs` are the v1 backend
   contract. `geometry_ref` is retained as audit/source metadata only. Raw-loop
-  lowering is intentionally disabled until canonical point/curve/surface-loop
-  lowering is implemented.
+  lowering remains disabled because canonical point/curve/surface-loop records
+  are the conformal-topology contract.
 - `TagPlanRecord` plus `BackendEntityTagRecord` is the tag ledger. Plan ids are
   stable; OCC tags and physical group ids are lowering results. If two live
   source ids map to one OCC dim-tag, canonicalization failed and the backend
@@ -377,6 +380,12 @@ def _volume_surface_tags(
     volume: Any,
     source_tags: Mapping[tuple[str, str], Sequence[GmshDimTag]],
 ) -> list[int]:
+    """Return unsigned OCC surface tags for `addSurfaceLoop()`.
+
+    `SurfaceRefRecord.orientation` remains compiler/audit metadata here. Gmsh
+    OCC curve-loop orientation cannot safely rely on negative tags, and this
+    backend does not extend that assumption to surface-loop tags.
+    """
     tags = [
         tag
         for surface_ref in volume.surface_refs

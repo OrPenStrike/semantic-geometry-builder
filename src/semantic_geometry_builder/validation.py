@@ -448,8 +448,8 @@ def validate_volume_surface_closure(
     """Validate volume surface references before backend lowering.
 
     Full closed-shell validation belongs to the canonical curve/loop plan. This
-    guard keeps the scaffold honest by rejecting missing references and leaving
-    geometric closure to `validate_curve_plan_coverage()` once loops are planned.
+    guard rejects missing references and then checks curve incidence from the
+    planned loops, before OCC is allowed to construct a volume.
     """
     surfaces_by_id = {surface.surface_id: surface for surface in surfaces}
     loops_by_id = {loop.loop_id: loop for loop in surface_loops}

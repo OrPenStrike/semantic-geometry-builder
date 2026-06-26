@@ -445,7 +445,8 @@ def plan_canonical_topology(
 ]:
     """Canonicalize planned surface boundaries into compiler-owned topology.
 
-    This is the next v1 implementation boundary. It must:
+    This is the v1 implementation boundary that turns surface geometry into a
+    topology registry. It must:
 
     - collect every outer/hole/quad boundary from planned surfaces;
     - create one `PointPlanRecord` per unique live coordinate;
@@ -459,9 +460,8 @@ def plan_canonical_topology(
       one surface id before tagging; and
     - make volume closure checkable without asking OCC to discover topology.
 
-    This function intentionally fails until the canonical topology registry is
-    implemented. Raw `geometry_ref` lowering is not a v1 conformal-geometry
-    contract.
+    Raw `geometry_ref` lowering is not a v1 conformal-geometry contract; the
+    backend consumes the planned point/curve/surface-loop refs produced here.
     """
     point_ids: dict[tuple[float, float, float], str] = {}
     point_coordinates: dict[str, tuple[float, float, float]] = {}
@@ -1035,6 +1035,11 @@ def plan_surface_partitions(
     interfaces: tuple[InterfacePlanRecord, ...],
 ) -> tuple[SurfacePartitionRecord, ...]:
     """Plan parent-interface partitions before live surfaces are created.
+
+    This function only consumes explicit `build_input.metadata["surface_partitions"]`
+    records. The normal tutorial inset path is `apply_inset_surface_partitions()`,
+    which creates child surfaces after route surfaces exist so it can partition
+    the actual live parent surface geometry.
 
     Ring/core regions are partition intent, not backend geometry. Each returned
     `SurfacePartitionRecord` must point to a child `SurfacePlanRecord` that
@@ -1695,9 +1700,10 @@ def plan_cut_host_operations(
 ) -> tuple[CutHostOperationRecord, ...]:
     """Group Route A/B construction bodies into host-cut operation plans.
 
-    This is semantic grouping only. The backend may execute compatible records
-    in batches, but must recover every member construction body and exposed
-    shell surface from these operation ids.
+    This is semantic grouping and provenance in the current v1 backend. Exposed
+    shell surfaces are already planned as `SurfacePlanRecord`s; these records
+    explain which construction bodies belong to each host exclusion policy
+    without asking the backend to discover new surfaces through boolean cuts.
     """
     if route == "C":
         return ()
@@ -2799,21 +2805,6 @@ def _loop_centroid(loop: Any) -> tuple[float, float]:
         sum(point[0] for point in points) / len(points),
         sum(point[1] for point in points) / len(points),
     )
-
-
-def _point_in_loop(point: tuple[float, float], loop: Any) -> bool:
-    x, y = point
-    points = tuple((float(item[0]), float(item[1])) for item in loop)
-    inside = False
-    previous = len(points) - 1
-    for index, (xi, yi) in enumerate(points):
-        xj, yj = points[previous]
-        if (yi > y) != (yj > y):
-            x_intersect = (xj - xi) * (y - yi) / (yj - yi) + xi
-            if x < x_intersect:
-                inside = not inside
-        previous = index
-    return inside
 
 
 def _surface_boundary_volume_ids(
@@ -4327,18 +4318,3 @@ def _default_host_solution_id(build_input: GeometryBuildInput) -> str:
         if _is_air_like_solution_entity(entity):
             return entity.semantic_id
     raise ValueError("GeometryBuildInput requires an air/vacuum host solution entity")
-
-
-def _default_substrate_solution_id(build_input: GeometryBuildInput) -> str:
-    for entity in build_input.entities:
-        if not _is_solution_entity(entity):
-            continue
-        tokens = {
-            entity.semantic_id.lower(),
-            entity.role.lower(),
-            entity.material_id.lower(),
-            entity.geometry_kind.lower(),
-        }
-        if any("substrate" in token for token in tokens):
-            return entity.semantic_id
-    raise ValueError("GeometryBuildInput requires a substrate solution entity")

@@ -67,9 +67,8 @@ This package does not own:
 ## Current Scope
 
 This repository currently contains the public API, data contracts, adapter
-input lowering, and an actively reviewed geometry-backend scaffold. The backend
-direction is being reset from fragment-first construction to
-surface-plan-first construction.
+input lowering, route-aware topology planner, and bottom-up Gmsh/OCC backend.
+The accepted v1 path is surface-plan-first construction.
 
 The fragment-first approach was tested and rejected for v1 as the default
 backend strategy. It is simple and general for small examples, but it pushes a
@@ -78,7 +77,7 @@ geometries, such as ground planes with high-vertex cutout boundaries, the
 workflow becomes too expensive and also makes interface identity depend on
 backend boolean results. That is the wrong source of truth for this package.
 
-The v1 backend target is:
+The v1 compiler flow is:
 
 ```text
 GeometryBuildInput
@@ -141,9 +140,10 @@ Current source layers:
   invariants.
 - `src/semantic_geometry_builder/export.py`: backend dim-tag to physical-group
   record conversion.
-- `src/semantic_geometry_builder/backends/`: backend construction experiments.
-  The accepted v1 direction is bottom-up planned surface/volume construction,
-  not fragment-first interface discovery.
+- `src/semantic_geometry_builder/backends/`: backend construction. The v1
+  backend consumes planned point/curve/surface-loop/surface/volume records and
+  writes one route XAO file; it does not discover interfaces through global
+  fragment operations.
 - `src/semantic_geometry_builder/models.py`: layout-tool-agnostic records,
   type aliases, and small contract guards.
 
@@ -184,15 +184,15 @@ planned by `TagPlanRecord` and the dim-tags recovered by
 
 - Route A: mixed surface-sheet / PEC-shell representation. Face metals and
   attached airbridge decks are represented by solver-active `MS`, `MA`, `MM`,
-  or `SA` interface surfaces carrying `surface_sheet` semantics.
-  Indium bumps and airbridge posts use construction bodies to cut host regions,
-  then expose solver-facing PEC `cutout_boundary_shell` surfaces. Route A
-  `surface_sheet` entities must not become construction cutters or standalone
-  overlay surfaces.
-- Route B: cut-out PEC boundary-shell representation. All conductors use
-  construction bodies to remove conductor interiors from solution regions, and
-  exposed PEC `cutout_boundary_shell` surfaces become the solver-facing
-  conductor representation.
+  or `SA` interface surfaces carrying `surface_sheet` semantics. Indium bumps
+  and airbridge posts carry construction-body/cut-operation provenance, but the
+  v1 backend receives their exposed PEC `cutout_boundary_shell` surfaces as
+  planned surfaces. Route A `surface_sheet` entities must not become
+  construction cutters or standalone overlay surfaces.
+- Route B: cut-out PEC boundary-shell representation. Conductors carry
+  construction-body/cut-operation provenance that explains which host regions
+  exclude conductor interiors. The solver-facing geometry is still the planned
+  exposed `cutout_boundary_shell` surface set handed to the backend.
 - Route C: retained material-volume representation. Conductors remain as
   `material_volume` regions. Required interfaces must be planned before
   backend geometry creation; they must not be discovered by global retained
@@ -234,7 +234,7 @@ loose tag lists inside tag metadata.
 
 ## Fixture Contract
 
-Fixture layouts under `fixtures/open_pdk/` use GDS plus semantic `.stack.json`.
+Tutorial assets under `tutorials/assets/` use GDS plus semantic `.stack.json`.
 Ansys/HFSS `.tech` files are not the semantic input contract for this package.
 
 ## Package Names

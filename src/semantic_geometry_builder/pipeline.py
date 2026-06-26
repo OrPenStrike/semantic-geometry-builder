@@ -2,7 +2,8 @@
 
 The heavy semantic work lives in `planning.py` and `validation.py`. This module
 keeps the public import path stable and owns only run orchestration: validate,
-plan, write sidecars, then hand the plan to the future bottom-up OCC backend.
+plan, write sidecars, hand the plan to the bottom-up OCC backend, then export
+physical groups.
 """
 
 from __future__ import annotations
