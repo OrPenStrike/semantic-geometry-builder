@@ -100,10 +100,14 @@ from cell adjacency before backend geometry is created. Horizontal adjacency
 creates top/bottom faces such as `MS`, `MA`, or `SA`; vertical adjacency from
 shared atomic 2D edges creates sidewall faces.
 
-Inset rings are planned before OCC construction: the planner should expand the
-parent interface into child ring/core `SurfacePlanRecord`s, disable the parent
-as live geometry, and only pass non-overlapping children downstream. The
-planner also owns the canonical topology registry: shared vertices, shared
+Inset rings are planned before OCC construction. A parent interface is only a
+logical aggregate: the planner must expand it into child ring/core
+`SurfacePlanRecord`s, disable the parent as live geometry, and only pass
+non-overlapping children downstream. Shared coplanar inset families are defined
+under the interface contract below; if the planner cannot prove that shared
+arrangement, the build must fail fast.
+
+The planner also owns the canonical topology registry: shared vertices, shared
 edges, and shared face patches must become shared `PointPlanRecord`s,
 `CurvePlanRecord`s, and ordered `SurfaceLoopRecord`s before OCC lowering.
 Backend line caches are allowed as a lowering optimization, but they are not
@@ -216,8 +220,17 @@ Inset rings are surface partition intent such as `BAND_0_50NM`,
 `BAND_50NM_100NM`, or `CORE_AFTER_1UM`; planning them must not run backend
 booleans. A `SurfacePartitionRecord` points from a parent interface to a child
 live `SurfacePlanRecord`. The child ring/core surfaces replace the parent as
-live geometry, and the parent surface becomes a logical aggregate only. Overlay
-ring surfaces are not a geometry or mesh mode, and overlay masks are
+live geometry, and the parent surface becomes a logical aggregate only.
+
+Inset partitioning must be plane-aware. If `SA`, `MS`, `MA`, `MM`, `SS`, or
+`AA` surfaces are coplanar and touch the same volume boundary, their inset
+curves must be generated from one shared coplanar arrangement instead of each
+surface independently offsetting itself. The shared arrangement is responsible
+for coverage, no overlaps, no gaps, no T-junctions hidden inside a curve, and a
+minimum-feature report that downstream mesh adapters can use. Until that
+arrangement and mesh contract are present for the affected plane family, inset
+builds should stop at planning. Overlay ring surfaces are not a geometry or
+mesh mode, and overlay masks are
 intentionally unsupported because they can create nonconformal geometry,
 duplicate parent/child boundary ownership, and ambiguous solver/EPR surface
 integration.

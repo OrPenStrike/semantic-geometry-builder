@@ -22,6 +22,7 @@ from semantic_geometry_builder.models import (
     CutHostOperationRecord,
     GeometryBuildInput,
     InterfacePlanRecord,
+    MeshSizeHintRecord,
     PointPlanRecord,
     RouteLiteral,
     SemanticEntitySpec,
@@ -400,15 +401,19 @@ def validate_surface_deduplication(
 def validate_no_surface_overlap(
     *,
     surfaces: tuple[SurfacePlanRecord, ...],
-    skip_owner_semantic_ids: set[str] | None = None,
 ) -> None:
-    """Reject same-plane partial overlap once canonical surfaces are available."""
-    skip_owner_semantic_ids = skip_owner_semantic_ids or set()
+    """Reject horizontal same-plane partial overlap for all solver-live surfaces.
+
+    This guard is intentionally not allowed to skip high-count conductors by
+    semantic owner. Physical groups may collapse many instances into one solver
+    label, but topology validation must still see every live surface. General
+    sidewall/arbitrary-plane overlap validation is a separate contract and must
+    fail fast before those inset cases are advertised as mesh-safe.
+    """
     horizontal_surfaces = tuple(
         (surface, z_um, region, _region_bounds(region))
         for surface in surfaces
         if not surface.construction_only
-        and not _skip_surface_overlap_validation(surface, skip_owner_semantic_ids)
         for z_um, region in (_horizontal_surface_region(surface),)
         if region
     )
@@ -437,6 +442,51 @@ def validate_no_surface_overlap(
             break
     if errors:
         raise ValueError("Invalid surface overlap: " + "; ".join(errors))
+
+
+def validate_inset_mesh_contract(
+    *,
+    surface_partitions: tuple[SurfacePartitionRecord, ...],
+    mesh_size_hints: tuple[MeshSizeHintRecord, ...],
+) -> None:
+    """Require every finite inset band to export a downstream mesh-size hint."""
+    hints_by_partition = {
+        hint.source_partition_id: hint
+        for hint in mesh_size_hints
+        if hint.source_partition_id is not None
+    }
+    errors: list[str] = []
+    for hint in mesh_size_hints:
+        if hint.max_size_um <= 0:
+            errors.append(f"{hint.target_id} mesh hint max_size_um must be positive")
+
+    for partition in surface_partitions:
+        if partition.parameterization == "occ_native_parametric":
+            errors.append(
+                f"{partition.partition_id} sidewall/arbitrary-plane inset "
+                "requires generalized coplanar-family validation"
+            )
+        if partition.band_min_um is None or partition.band_max_um is None:
+            continue
+        width_um = partition.band_max_um - partition.band_min_um
+        if width_um <= 0:
+            continue
+        hint = hints_by_partition.get(partition.partition_id)
+        if hint is None:
+            errors.append(f"{partition.partition_id} finite inset band lacks mesh hint")
+            continue
+        if hint.target_id != partition.child_surface_id:
+            errors.append(
+                f"{partition.partition_id} mesh hint targets {hint.target_id}, "
+                f"expected {partition.child_surface_id}"
+            )
+        if hint.max_size_um > (width_um / 2.0) + 1e-12:
+            errors.append(
+                f"{partition.partition_id} mesh hint {hint.max_size_um} um is "
+                f"too coarse for {width_um} um inset band"
+            )
+    if errors:
+        raise ValueError("Invalid inset mesh contract: " + "; ".join(errors))
 
 
 def validate_volume_surface_closure(
@@ -727,22 +777,6 @@ def _regions_overlap(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
 
 def _coordinate_2d_key(point: tuple[float, float]) -> tuple[float, float]:
     return (round(float(point[0]), 9), round(float(point[1]), 9))
-
-
-def _skip_surface_overlap_validation(
-    surface: SurfacePlanRecord,
-    skip_owner_semantic_ids: set[str],
-) -> bool:
-    if not skip_owner_semantic_ids:
-        return False
-    owner_ids = {surface.owner_semantic_id}
-    for key in ("owner_semantic_ids", "boundary_volume_ids"):
-        raw = surface.metadata.get(key, ())
-        if isinstance(raw, str):
-            owner_ids.add(raw)
-        elif isinstance(raw, tuple | list | set):
-            owner_ids.update(str(value) for value in raw)
-    return bool(owner_ids & skip_owner_semantic_ids)
 
 
 def _region_bounds(region: tuple[Any, ...]) -> tuple[float, float, float, float]:

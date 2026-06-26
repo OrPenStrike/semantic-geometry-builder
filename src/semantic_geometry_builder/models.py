@@ -76,6 +76,10 @@ SurfaceParameterizationKindLiteral = Literal[
     "occ_native_parametric",
 ]
 SurfacePartitionApplicationModeLiteral = Literal["replace_parent_with_children"]
+InsetPartitionSourceLiteral = Literal[
+    "coplanar_joint_arrangement",
+    "surface_local_fallback",
+]
 CurveKindLiteral = Literal["line_segment"]
 CurveOrientationLiteral = Literal[1, -1]
 SurfaceLoopRoleLiteral = Literal["outer", "hole"]
@@ -199,9 +203,13 @@ class SurfacePlanRecord:
     v1 backend lowering should consume `outer_loop_ref` and `hole_loop_refs`.
     `geometry_ref` remains as audit/source metadata: it may carry `plane` or
     `contact_plane`, `outer_loop`, optional `hole_loops`, optional `footprint`,
-    optional `inset_band`, and optional `loop_geometry_ref`. A surface that
-    cannot be tied to canonical loop refs must fail during canonicalization
-    rather than falling back to global fragment-based discovery.
+    optional `inset_band`, and optional `loop_geometry_ref`. Inset children that
+    belong to the same coplanar arrangement should also carry
+    `inset_family_ids` or `coplanar_partition_id` so reviewers can see that
+    `SA`/`MS`/`MA` children were generated from one shared plane graph instead
+    of from isolated per-surface offsets. A surface that cannot be tied to
+    canonical loop refs must fail during canonicalization rather than falling
+    back to global fragment-based discovery.
 
     `metadata` may carry side/exposure semantics such as `interface_kinds`,
     `surface_side`, `owner_semantic_ids`, `adjacent_domain_id`,
@@ -416,9 +424,13 @@ class SurfacePartitionRecord:
     `SURF__MS__Metal__Substrate__RING_0_50NM` and
     `SURF__MS__Metal__Substrate__CORE`.
 
-    `metadata` may carry `inset_band`, `outer_loop`, `hole_loops`, and
-    `loop_geometry_ref` for the child surface. The child must be directly
-    buildable; overlay masks are not supported.
+    `metadata` may carry `inset_band`, `outer_loop`, `hole_loops`,
+    `loop_geometry_ref`, `inset_family_ids`, and `coplanar_partition_id` for the
+    child surface. For coplanar `SA`/`MS`/`MA` families, this record is not
+    proof that one isolated parent was safely offset; it must point back to the
+    shared plane arrangement that generated every adjacent child surface on
+    that plane. The child must be directly buildable; overlay masks are not
+    supported.
     """
 
     partition_id: str
@@ -436,12 +448,53 @@ class SurfacePartitionRecord:
 
 
 @dataclass(frozen=True)
+class CoplanarInsetFamilyRecord:
+    """Topology contract for inset children that live on one shared plane.
+
+    A family is not a comment on individual surfaces; it is the reviewable
+    statement that several parent interfaces share one plane and one boundary
+    volume, so their inset children must be generated from one coplanar
+    arrangement. `surface_local_fallback` is allowed only for isolated parents
+    and must fail fast when adjacent parents would otherwise create independent
+    near-duplicate points or curves.
+    """
+
+    family_id: str
+    plane_key: str
+    boundary_volume_id: str
+    parent_surface_ids: tuple[str, ...]
+    breakpoints_um: tuple[float, ...]
+    source: InsetPartitionSourceLiteral
+    child_surface_ids: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MeshSizeHintRecord:
+    """Mesh-size contract derived from planned topology, not from backend mesh.
+
+    Inset bands are solver-active geometry, so the compiler must tell downstream
+    mesh adapters the smallest local feature it created. A 50 nm band should
+    produce a max-size hint near 25 nm, otherwise CAD can be conformal while the
+    generated tetrahedra are still unsafe for solver use.
+    """
+
+    target_id: str
+    max_size_um: float
+    reason: str
+    source_partition_id: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ConstructionPlanRecord:
     """Route-aware handoff from semantic planning to bottom-up OCC creation.
 
     This is the complete input to the backend. `interfaces` explain why shared
     surfaces exist, `surface_partitions` explain parent-to-child inset
-    coverage, `points`, `curves`, and `surface_loops` make shared topology
+    coverage, `coplanar_inset_families` explain shared-plane inset ownership,
+    `mesh_size_hints` explain solver-mesh constraints created by tiny planned
+    features, `points`, `curves`, and `surface_loops` make shared topology
     canonical, `surfaces` and `volumes` describe geometry to build,
     `construction_bodies` and `cut_operations` describe Route A/B host cuts,
     and `tags` define physical names before backend dim-tags exist.
@@ -454,6 +507,8 @@ class ConstructionPlanRecord:
     route: RouteLiteral
     interfaces: tuple[InterfacePlanRecord, ...] = ()
     surface_partitions: tuple[SurfacePartitionRecord, ...] = ()
+    coplanar_inset_families: tuple[CoplanarInsetFamilyRecord, ...] = ()
+    mesh_size_hints: tuple[MeshSizeHintRecord, ...] = ()
     points: tuple[PointPlanRecord, ...] = ()
     curves: tuple[CurvePlanRecord, ...] = ()
     surface_loops: tuple[SurfaceLoopRecord, ...] = ()

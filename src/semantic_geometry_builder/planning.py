@@ -31,6 +31,11 @@ Route special cases to preserve during implementation:
   interface with child ring/core `SurfacePlanRecord`s before backend lowering.
   The child surfaces must exactly cover the parent interface without overlap or
   gaps, and feasibility must be checked before treating the route as buildable.
+  When adjacent interface parents are coplanar, such as `SA` and `MS` on one
+  substrate face, inset is a property of the shared plane arrangement rather
+  than of either parent alone. The planner must generate one coplanar inset
+  family, then emit child surfaces for each interface label from that shared
+  topology graph.
 
 Route outputs:
 
@@ -70,6 +75,9 @@ Hard invariants for this registry:
 - no planned curve may contain another planned point in its interior;
 - parent interface surfaces must be replaced by non-overlapping child
   ring/core patches, never kept live beside those children;
+- coplanar inset children that share points, curves, or boundary-volume
+  ownership must come from one joint planar arrangement, not independent
+  per-surface offset operations;
 - every MA/MS/MM/SA/SS/AA surface must trace back to `InterfacePlanRecord`;
 - live surfaces on the same plane must not have duplicate or overlapping area;
 - volume shells must be checkable from planned curve incidence before OCC runs.
@@ -90,11 +98,13 @@ from semantic_geometry_builder.models import (
     HIGH_COUNT_LOCAL_CONDUCTOR_PART_ROLES,
     ConstructionBodyPlanRecord,
     ConstructionPlanRecord,
+    CoplanarInsetFamilyRecord,
     CurvePlanRecord,
     CurveRefRecord,
     CutHostOperationRecord,
     GeometryBuildInput,
     InterfacePlanRecord,
+    MeshSizeHintRecord,
     PointPlanRecord,
     RouteLiteral,
     SemanticEntitySpec,
@@ -110,6 +120,7 @@ from semantic_geometry_builder.validation import (
     _is_air_like_solution_entity,
     _is_solution_entity,
     validate_curve_plan_coverage,
+    validate_inset_mesh_contract,
     validate_interface_surface_source_of_truth,
     validate_no_surface_overlap,
     validate_route_operation_coverage,
@@ -221,6 +232,36 @@ def build_route_construction_plan(
         ),
     )
     surface_partitions = (*surface_partitions, *generated_surface_partitions)
+    coplanar_inset_families = _timed(
+        timings,
+        "plan_coplanar_inset_families",
+        lambda: plan_coplanar_inset_families(
+            surfaces=surfaces,
+            surface_partitions=surface_partitions,
+            breakpoints_um=_inset_breakpoints_for_route(build_input, route),
+        ),
+    )
+    _timed(
+        timings,
+        "validate_coplanar_inset_family_contract",
+        lambda: validate_coplanar_inset_family_contract(
+            surfaces=surfaces,
+            coplanar_inset_families=coplanar_inset_families,
+        ),
+    )
+    mesh_size_hints = _timed(
+        timings,
+        "plan_mesh_size_hints",
+        lambda: plan_mesh_size_hints(surface_partitions=surface_partitions),
+    )
+    _timed(
+        timings,
+        "validate_inset_mesh_contract",
+        lambda: validate_inset_mesh_contract(
+            surface_partitions=surface_partitions,
+            mesh_size_hints=mesh_size_hints,
+        ),
+    )
     _timed(
         timings,
         "validate_surface_sheet_interface_coverage",
@@ -261,10 +302,7 @@ def build_route_construction_plan(
     _timed(
         timings,
         "validate_no_surface_overlap",
-        lambda: validate_no_surface_overlap(
-            surfaces=surfaces,
-            skip_owner_semantic_ids=_overlap_validation_skip_owner_ids(build_input),
-        ),
+        lambda: validate_no_surface_overlap(surfaces=surfaces),
     )
     volumes = _timed(
         timings,
@@ -342,6 +380,8 @@ def build_route_construction_plan(
         route=route,
         interfaces=interfaces,
         surface_partitions=surface_partitions,
+        coplanar_inset_families=coplanar_inset_families,
+        mesh_size_hints=mesh_size_hints,
         points=points,
         curves=curves,
         surface_loops=surface_loops,
@@ -471,7 +511,7 @@ def plan_canonical_topology(
     curve_interface_ids: dict[str, set[str]] = {}
     curve_surface_ids: dict[str, set[str]] = {}
     curve_volume_ids: dict[str, set[str]] = {}
-    loop_ids: dict[tuple[str, tuple[str, ...]], str] = {}
+    loop_ids: dict[tuple[str, tuple[tuple[str, int], ...]], str] = {}
     loops: dict[str, SurfaceLoopRecord] = {}
     canonical_surfaces: list[SurfacePlanRecord] = []
     surface_specs: list[
@@ -568,7 +608,7 @@ def plan_canonical_topology(
                     strict=False,
                 )
             )
-            loop_key = (role, tuple(sorted(ref.curve_id for ref in curve_refs)))
+            loop_key = (role, _ordered_loop_signature(curve_refs))
             loop_id = loop_ids.get(loop_key)
             if loop_id is None:
                 suffix = "OUTER" if role == "outer" else f"HOLE_{index:04d}"
@@ -1120,12 +1160,19 @@ def apply_inset_surface_partitions(
 ) -> tuple[tuple[SurfacePlanRecord, ...], tuple[SurfacePartitionRecord, ...]]:
     """Replace eligible parent interface surfaces with inset child surfaces.
 
-    Planar surfaces use real 2D inward offsets. Sidewall surfaces use
-    sidewall-specific strip partitioning from both sides of the shorter local
-    axis: requested thresholds that are not strictly smaller than half of that
-    axis length are skipped, and the remaining middle area becomes `CORE`. This
-    avoids 100 nm / 200 nm / 500 nm / 1 um bands degenerating on a 200 nm
-    metal-thickness sidewall while keeping every child surface backend-buildable.
+    The v1 target is coplanar-family partitioning: all inset-eligible
+    `SA`/`MS`/`MA`/`MM`/`SS`/`AA` parents on the same plane that touch the same
+    volume boundary must be partitioned from one shared planar topology graph.
+    This preserves shared points/curves between adjacent child surfaces and
+    prevents the `SA` side and `MS` side of a metal edge from inventing
+    independent near-duplicate micro topology.
+
+    The current implementation still performs the low-risk fallback for
+    isolated parents: planar surfaces use real 2D inward offsets; sidewall
+    surfaces use sidewall-specific strip partitioning from both sides of the
+    shorter local axis. Requested thresholds that are not strictly smaller than
+    half of that axis length are skipped, and the remaining middle area becomes
+    `CORE`.
     """
     breakpoints_um = _inset_breakpoints_for_route(build_input, route)
     if len(breakpoints_um) <= 1:
@@ -1153,6 +1200,7 @@ def apply_inset_surface_partitions(
             )
 
         parent_physical_name = _surface_physical_name(surface)
+        inset_family_ids = _inset_family_ids(surface)
         for index, (label, band_min_um, band_max_um, geometry_ref) in enumerate(
             inset_geometry_refs
         ):
@@ -1166,6 +1214,8 @@ def apply_inset_surface_partitions(
             metadata = {
                 **dict(surface.metadata),
                 "inset_band": inset_band,
+                "inset_family_ids": inset_family_ids,
+                "inset_partition_source": "surface_local_fallback",
                 "physical_name": f"{parent_physical_name}__{label}",
             }
             child_surfaces.append(
@@ -1200,11 +1250,153 @@ def apply_inset_surface_partitions(
                     valid_routes=(route,),
                     metadata={
                         "inset_band": inset_band,
+                        "inset_family_ids": inset_family_ids,
+                        "inset_partition_source": "surface_local_fallback",
                         "parent_surface_id": surface.surface_id,
                     },
                 )
             )
     return tuple(child_surfaces), tuple(partitions)
+
+
+def plan_coplanar_inset_families(
+    *,
+    surfaces: tuple[SurfacePlanRecord, ...],
+    surface_partitions: tuple[SurfacePartitionRecord, ...],
+    breakpoints_um: tuple[float, ...],
+) -> tuple[CoplanarInsetFamilyRecord, ...]:
+    """Collect shared-plane inset ownership into first-class plan records."""
+    partitions_by_child = {
+        partition.child_surface_id: partition
+        for partition in surface_partitions
+    }
+    families: dict[str, dict[str, Any]] = {}
+    for surface in surfaces:
+        if surface.parent_surface_id is None:
+            continue
+        partition = partitions_by_child.get(surface.surface_id)
+        for family_id in surface.metadata.get("inset_family_ids", ()):
+            family_key = str(family_id)
+            entry = families.setdefault(
+                family_key,
+                {
+                    "parent_surface_ids": set(),
+                    "child_surface_ids": set(),
+                    "partition_ids": set(),
+                    "sources": set(),
+                },
+            )
+            entry["parent_surface_ids"].add(surface.parent_surface_id)
+            entry["child_surface_ids"].add(surface.surface_id)
+            if partition is not None:
+                entry["partition_ids"].add(partition.partition_id)
+            source = surface.metadata.get(
+                "inset_partition_source",
+                "surface_local_fallback",
+            )
+            entry["sources"].add(str(source))
+
+    records: list[CoplanarInsetFamilyRecord] = []
+    for family_id, entry in sorted(families.items()):
+        if len(entry["sources"]) != 1:
+            raise ValueError(
+                f"{family_id} has mixed inset partition sources "
+                f"{sorted(entry['sources'])!r}"
+            )
+        plane_key, boundary_volume_id = _parse_inset_family_id(family_id)
+        source = next(iter(entry["sources"]))
+        records.append(
+            CoplanarInsetFamilyRecord(
+                family_id=family_id,
+                plane_key=plane_key,
+                boundary_volume_id=boundary_volume_id,
+                parent_surface_ids=tuple(sorted(entry["parent_surface_ids"])),
+                breakpoints_um=breakpoints_um,
+                source=source,  # type: ignore[arg-type]
+                child_surface_ids=tuple(sorted(entry["child_surface_ids"])),
+                metadata={
+                    "source_partition_ids": tuple(sorted(entry["partition_ids"])),
+                },
+            )
+        )
+    return tuple(records)
+
+
+def plan_mesh_size_hints(
+    *,
+    surface_partitions: tuple[SurfacePartitionRecord, ...],
+) -> tuple[MeshSizeHintRecord, ...]:
+    """Export mesh-size hints implied by finite inset bands."""
+    hints: list[MeshSizeHintRecord] = []
+    for partition in surface_partitions:
+        if partition.band_min_um is None or partition.band_max_um is None:
+            continue
+        width_um = partition.band_max_um - partition.band_min_um
+        if width_um <= 0:
+            continue
+        hints.append(
+            MeshSizeHintRecord(
+                target_id=partition.child_surface_id,
+                max_size_um=width_um / 2.0,
+                reason="inset_band_width",
+                source_partition_id=partition.partition_id,
+                metadata={
+                    "band_min_um": partition.band_min_um,
+                    "band_max_um": partition.band_max_um,
+                    "required_elements_across_band": 2,
+                },
+            )
+        )
+    return tuple(hints)
+
+
+def validate_coplanar_inset_family_contract(
+    *,
+    surfaces: tuple[SurfacePlanRecord, ...],
+    coplanar_inset_families: tuple[CoplanarInsetFamilyRecord, ...],
+) -> None:
+    """Refuse local inset when one coplanar family spans multiple parents."""
+    source_by_family = {
+        family.family_id: family.source
+        for family in coplanar_inset_families
+    }
+    family_parent_bounds: dict[str, dict[str, dict[str, float]]] = {}
+    for surface in surfaces:
+        parent_id = surface.parent_surface_id
+        if parent_id is None:
+            continue
+        for family_id in surface.metadata.get("inset_family_ids", ()):
+            source = source_by_family.get(str(family_id))
+            if source is None:
+                raise ValueError(f"{surface.surface_id} references unknown {family_id}")
+            if source != "coplanar_joint_arrangement":
+                family = family_parent_bounds.setdefault(str(family_id), {})
+                bounds = _surface_planar_bounds(surface)
+                existing = family.get(parent_id)
+                family[parent_id] = (
+                    bounds
+                    if existing is None
+                    else _merge_bounds(existing, bounds)
+                )
+    invalid: dict[str, list[str]] = {}
+    for family_id, parent_bounds in family_parent_bounds.items():
+        parent_ids = sorted(parent_bounds)
+        for index, left_id in enumerate(parent_ids):
+            for right_id in parent_ids[index + 1 :]:
+                if _bounds_touch_or_overlap(
+                    parent_bounds[left_id],
+                    parent_bounds[right_id],
+                ):
+                    invalid.setdefault(family_id, []).extend((left_id, right_id))
+                    break
+            if family_id in invalid:
+                invalid[family_id] = sorted(set(invalid[family_id]))
+                break
+    if invalid:
+        raise NotImplementedError(
+            "coplanar inset requires joint plane partitioning; local "
+            f"per-surface offsets are not conformal enough for {invalid!r}"
+        )
 
 
 def plan_route_construction_bodies(
@@ -2398,16 +2590,6 @@ def _plan_substrate_air_surfaces(
     return tuple(records)
 
 
-def _overlap_validation_skip_owner_ids(
-    build_input: GeometryBuildInput,
-) -> set[str]:
-    return {
-        entity.semantic_id
-        for entity in build_input.entities
-        if entity.part_role in HIGH_COUNT_LOCAL_CONDUCTOR_PART_ROLES
-    }
-
-
 def _solution_interface_geometry_refs(
     parent_geometry_ref: Mapping[str, Any],
     plane_conductors: Sequence[SemanticEntitySpec],
@@ -2934,6 +3116,108 @@ def _unique_ids(values: Any) -> tuple[str, ...]:
         result.append(item)
         seen.add(item)
     return tuple(result)
+
+
+def _inset_family_ids(surface: SurfacePlanRecord) -> tuple[str, ...]:
+    """Return coplanar inset family ids for reviewable joint partitioning.
+
+    A family is keyed by plane plus boundary volume. `SA` and `MS` children on a
+    substrate top face therefore share the substrate family even though their
+    other owner differs. Sidewall surfaces do not get this planar family id.
+    """
+    if "outer_loop" not in surface.geometry_ref:
+        return ()
+    plane = surface.geometry_ref.get("plane") or surface.geometry_ref.get(
+        "contact_plane",
+    )
+    if not isinstance(plane, Mapping):
+        return ()
+    axis = str(plane.get("axis", "")).lower()
+    if not axis:
+        return ()
+    value_um = round(
+        _geometry_ref_surface_z_um(surface.geometry_ref)
+        if axis == "z"
+        else float(plane["value_um"]),
+        9,
+    )
+    volumes = surface.metadata.get("boundary_volume_ids", ())
+    if isinstance(volumes, str):
+        volume_ids = (volumes,)
+    else:
+        volume_ids = tuple(str(value) for value in volumes)
+    return tuple(
+        f"COPLANAR_INSET__{axis.upper()}_{value_um}__VOL_{volume_id}"
+        for volume_id in sorted(set(volume_ids))
+    )
+
+
+def _parse_inset_family_id(family_id: str) -> tuple[str, str]:
+    prefix = "COPLANAR_INSET__"
+    if not family_id.startswith(prefix) or "__VOL_" not in family_id:
+        raise ValueError(f"invalid coplanar inset family id: {family_id}")
+    plane_key, boundary_volume_id = family_id.removeprefix(prefix).split(
+        "__VOL_",
+        1,
+    )
+    if not plane_key or not boundary_volume_id:
+        raise ValueError(f"invalid coplanar inset family id: {family_id}")
+    return plane_key, boundary_volume_id
+
+
+def _ordered_loop_signature(
+    curve_refs: tuple[CurveRefRecord, ...],
+) -> tuple[tuple[str, int], ...]:
+    """Return a rotation-stable loop signature without discarding orientation."""
+    signature = tuple((ref.curve_id, ref.orientation) for ref in curve_refs)
+    if not signature:
+        return ()
+    rotations = (
+        signature[index:] + signature[:index]
+        for index in range(len(signature))
+    )
+    return min(rotations)
+
+
+def _surface_planar_bounds(surface: SurfacePlanRecord) -> dict[str, float]:
+    points = [
+        point
+        for loop in (
+            surface.geometry_ref["outer_loop"],
+            *surface.geometry_ref.get("hole_loops", ()),
+        )
+        for point in _clean_loop(loop)
+    ]
+    return {
+        "x_min_um": min(point[0] for point in points),
+        "y_min_um": min(point[1] for point in points),
+        "x_max_um": max(point[0] for point in points),
+        "y_max_um": max(point[1] for point in points),
+    }
+
+
+def _merge_bounds(
+    first: Mapping[str, float],
+    second: Mapping[str, float],
+) -> dict[str, float]:
+    return {
+        "x_min_um": min(float(first["x_min_um"]), float(second["x_min_um"])),
+        "y_min_um": min(float(first["y_min_um"]), float(second["y_min_um"])),
+        "x_max_um": max(float(first["x_max_um"]), float(second["x_max_um"])),
+        "y_max_um": max(float(first["y_max_um"]), float(second["y_max_um"])),
+    }
+
+
+def _bounds_touch_or_overlap(
+    first: Mapping[str, float],
+    second: Mapping[str, float],
+) -> bool:
+    return not (
+        float(first["x_max_um"]) < float(second["x_min_um"]) - _INSET_EPS_UM
+        or float(second["x_max_um"]) < float(first["x_min_um"]) - _INSET_EPS_UM
+        or float(first["y_max_um"]) < float(second["y_min_um"]) - _INSET_EPS_UM
+        or float(second["y_max_um"]) < float(first["y_min_um"]) - _INSET_EPS_UM
+    )
 
 
 def _route_a_sheet_boundary_volume_ids(
