@@ -8,6 +8,7 @@ plan, write sidecars, then hand the plan to the future bottom-up OCC backend.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ from semantic_geometry_builder.models import (
 )
 from semantic_geometry_builder.planning import (
     build_route_construction_plan,
+    plan_conductor_contact_patches,
     plan_cut_host_operations,
     plan_route_construction_bodies,
     plan_route_surfaces,
@@ -55,6 +57,7 @@ __all__ = [
     "SemanticGeometryBuilder",
     "build_route_construction_plan",
     "export_physical_group_records",
+    "plan_conductor_contact_patches",
     "plan_cut_host_operations",
     "plan_route_construction_bodies",
     "plan_route_surfaces",
@@ -109,32 +112,163 @@ class SemanticGeometryBuilder:
         metadata_dir = run_path / RUN_METADATA_DIR / SEMANTIC_GEOMETRY_METADATA_DIR
         geometry_dir = run_path / "geometry"
         geometry_dir.mkdir(parents=True, exist_ok=True)
+        timings: list[dict[str, Any]] = []
+        plan = None
+        built_plan = None
+        started = time.perf_counter()
 
-        validated_input = validate_geometry_input(build_input)
-        validate_selected_route(validated_input, route)
-        _write_stage_sidecar(
-            metadata_dir,
-            "01_validate_geometry_input",
-            validated_input,
-        )
+        try:
+            validated_input = _timed(
+                timings,
+                "validate_geometry_input",
+                lambda: validate_geometry_input(build_input),
+            )
+            _timed(
+                timings,
+                "validate_selected_route",
+                lambda: validate_selected_route(validated_input, route),
+            )
+            _timed(
+                timings,
+                "write_01_validate_geometry_input",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "01_validate_geometry_input",
+                    validated_input,
+                ),
+            )
 
-        plan = build_route_construction_plan(validated_input, route=route)
-        _write_stage_sidecar(metadata_dir, "02_build_route_construction_plan", plan)
+            plan = _timed(
+                timings,
+                "build_route_construction_plan",
+                lambda: build_route_construction_plan(validated_input, route=route),
+            )
+            _timed(
+                timings,
+                "write_02_build_route_construction_plan",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "02_build_route_construction_plan",
+                    plan,
+                ),
+            )
 
-        built_plan = write_occ_geometry_from_plan(
-            plan,
-            xao_path=geometry_dir / f"semantic_geometry_route_{route.lower()}.xao",
-        )
-        _write_stage_sidecar(metadata_dir, "03_build_occ_geometry", built_plan)
+            built_plan = _timed(
+                timings,
+                "write_occ_geometry_from_plan",
+                lambda: write_occ_geometry_from_plan(
+                    plan,
+                    xao_path=(
+                        geometry_dir
+                        / f"semantic_geometry_route_{route.lower()}.xao"
+                    ),
+                ),
+            )
+            _timed(
+                timings,
+                "write_03_build_occ_geometry",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "03_build_occ_geometry",
+                    built_plan,
+                ),
+            )
 
-        validate_backend_tag_ledger(backend_tags=built_plan.backend_entity_tags)
-        physical_groups = export_physical_group_records(built_plan)
-        _write_stage_sidecar(
-            metadata_dir,
-            "04_export_physical_groups",
-            physical_groups,
-        )
-        return physical_groups
+            _timed(
+                timings,
+                "validate_backend_tag_ledger",
+                lambda: validate_backend_tag_ledger(
+                    backend_tags=built_plan.backend_entity_tags
+                ),
+            )
+            physical_groups = _timed(
+                timings,
+                "export_physical_group_records",
+                lambda: export_physical_group_records(built_plan),
+            )
+            _timed(
+                timings,
+                "write_04_export_physical_groups",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "04_export_physical_groups",
+                    physical_groups,
+                ),
+            )
+            return physical_groups
+        finally:
+            _write_stage_sidecar(
+                metadata_dir,
+                "00_timing",
+                _timing_payload(route, timings, plan, built_plan, started),
+            )
+
+
+def _timed(
+    timings: list[dict[str, Any]],
+    stage: str,
+    fn: Any,
+) -> Any:
+    started = time.perf_counter()
+    try:
+        result = fn()
+    except Exception:
+        timings.append(_timing_record(stage, started, "failed"))
+        raise
+    timings.append(_timing_record(stage, started, "done"))
+    return result
+
+
+def _timing_record(stage: str, started: float, status: str) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "seconds": round(time.perf_counter() - started, 6),
+        "status": status,
+    }
+
+
+def _timing_payload(
+    route: RouteLiteral,
+    timings: list[dict[str, Any]],
+    plan: Any,
+    built_plan: Any,
+    started: float,
+) -> dict[str, Any]:
+    return {
+        "route": route,
+        "total_seconds": round(time.perf_counter() - started, 6),
+        "counts": _timing_counts(plan, built_plan),
+        "stages": timings,
+        "planning_stages": list(getattr(plan, "metadata", {}).get("timings", ())),
+        "backend_stages": list(
+            getattr(built_plan, "metadata", {}).get("backend_timings", ())
+        ),
+    }
+
+
+def _timing_counts(plan: Any, built_plan: Any) -> dict[str, Any]:
+    if plan is None:
+        return {}
+    counts = {
+        "interfaces": len(getattr(plan, "interfaces", ())),
+        "surface_partitions": len(getattr(plan, "surface_partitions", ())),
+        "points": len(getattr(plan, "points", ())),
+        "curves": len(getattr(plan, "curves", ())),
+        "surface_loops": len(getattr(plan, "surface_loops", ())),
+        "surfaces": len(getattr(plan, "surfaces", ())),
+        "volumes": len(getattr(plan, "volumes", ())),
+        "construction_bodies": len(getattr(plan, "construction_bodies", ())),
+        "cut_operations": len(getattr(plan, "cut_operations", ())),
+        "tags": len(getattr(plan, "tags", ())),
+    }
+    xao_path = (
+        getattr(built_plan, "metadata", {}).get("xao_path")
+        if built_plan
+        else None
+    )
+    if xao_path and Path(xao_path).is_file():
+        counts["xao_bytes"] = Path(xao_path).stat().st_size
+    return counts
 
 
 def _write_stage_sidecar(path: Path, stage_name: str, payload: Any) -> None:

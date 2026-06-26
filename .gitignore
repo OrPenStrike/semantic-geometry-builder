@@ -12,3 +12,4 @@ build/
 *.step
 *.stp
 tutorials/runs/
+tmp/

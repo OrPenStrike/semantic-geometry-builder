@@ -8,7 +8,7 @@
     "source_cell": "orpen_sc_pdk.cells.flip_chip.sim_flip_chip_distance",
     "notes": [
       "D0_TOP_M1 draw polygons are selector-point assigned as Unassigned until semantic naming is reviewed.",
-      "High-count indium bump arrays are recorded in deferred_high_count_layers; the current v1 planner must not pretend those 8227-object layers are runnable yet.",
+      "High-count indium bump arrays are split into per-polygon semantic bump bodies so contact patches can be planned explicitly.",
       "Under-bump metal is deliberately ignored because it does not enter the simulation pipeline.",
       "Layer 202/1 is a Palace lumped-port sheet source layer; it is ignored until v1 has an explicit port-sheet plan."
     ],
@@ -37,24 +37,7 @@
       "name": "D0_D1_UNDER_BUMP",
       "reason": "under-bump metal is not simulated"
     }
-  ],
-    "deferred_high_count_layers": [
-      {
-        "layer": 40,
-        "datatype": 0,
-        "name": "D0_D1_INDIUM_BUMP",
-        "polygon_count": 8227,
-        "intended_part_role": "bump_body",
-        "intended_route_representations": {
-          "A": "cutout_boundary_shell",
-          "B": "cutout_boundary_shell",
-          "C": "material_volume"
-        },
-        "z_um": 0.2,
-        "thickness_um": 9.8,
-        "deferred_reason": "requires high-count local contact-patch planner before route build"
-      }
-    ]
+  ]
   },
   "solution_regions": {
     "D0_To_D1_Air": {
@@ -911,6 +894,27 @@
       },
       "route_representations": {
         "A": "surface_sheet",
+        "B": "cutout_boundary_shell",
+        "C": "material_volume"
+      }
+    },
+    {
+      "layer": 40,
+      "datatype": 0,
+      "semantic_id": "D0_D1_INDIUM_BUMP",
+      "role": "metal",
+      "material_id": "indium",
+      "part_role": "bump_body",
+      "net_id": "GND",
+      "geometry_kind": "layout_extrusion",
+      "geometry": {
+        "z_um": 0.2,
+        "thickness_um": 9.8,
+        "geometry_source": "gds_polygon",
+        "split_polygons_as_entities": true
+      },
+      "route_representations": {
+        "A": "cutout_boundary_shell",
         "B": "cutout_boundary_shell",
         "C": "material_volume"
       }

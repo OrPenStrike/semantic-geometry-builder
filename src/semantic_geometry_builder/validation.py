@@ -9,6 +9,7 @@ ledger mappings before Gmsh/OCC is asked to materialize anything.
 from __future__ import annotations
 
 import json
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any
@@ -32,6 +33,9 @@ from semantic_geometry_builder.models import (
 )
 
 _INTERFACE_KINDS = {"MM", "SS", "AA", "MS", "MA", "SA"}
+# gdstk booleans can leave tiny numerical slivers at curved mask boundaries;
+# topology-significant overlaps are orders of magnitude larger than this.
+_BOOLEAN_AREA_EPS_UM2 = 1e-8
 
 
 def validate_geometry_input(build_input: GeometryBuildInput) -> GeometryBuildInput:
@@ -266,17 +270,24 @@ def validate_curve_plan_coverage(
             )
         curve_signatures[signature] = curve.curve_id
 
+    point_axis_index = _point_axis_index(points_by_id)
+    point_line_index = _axis_aligned_point_index(points_by_id)
     for curve in curves:
         start = points_by_id.get(curve.start_point_id)
         end = points_by_id.get(curve.end_point_id)
         if start is None or end is None:
             continue
         interior_points = [
-            point.point_id
-            for point in points
-            if point.point_id not in {curve.start_point_id, curve.end_point_id}
+            point_id
+            for point_id in _segment_candidate_point_ids(
+                start.coordinate,
+                end.coordinate,
+                point_axis_index,
+                point_line_index,
+            )
+            if point_id not in {curve.start_point_id, curve.end_point_id}
             and _point_on_segment_interior(
-                point.coordinate,
+                points_by_id[point_id].coordinate,
                 start.coordinate,
                 end.coordinate,
             )
@@ -389,24 +400,41 @@ def validate_surface_deduplication(
 def validate_no_surface_overlap(
     *,
     surfaces: tuple[SurfacePlanRecord, ...],
+    skip_owner_semantic_ids: set[str] | None = None,
 ) -> None:
     """Reject same-plane partial overlap once canonical surfaces are available."""
+    skip_owner_semantic_ids = skip_owner_semantic_ids or set()
     horizontal_surfaces = tuple(
-        (surface, z_um, region)
+        (surface, z_um, region, _region_bounds(region))
         for surface in surfaces
         if not surface.construction_only
+        and not _skip_surface_overlap_validation(surface, skip_owner_semantic_ids)
         for z_um, region in (_horizontal_surface_region(surface),)
         if region
     )
+    surfaces_by_z = {}
+    for surface, z_um, region, bounds in horizontal_surfaces:
+        surfaces_by_z.setdefault(round(z_um, 9), []).append((surface, region, bounds))
+
     errors: list[str] = []
-    for index, (left, left_z_um, left_region) in enumerate(horizontal_surfaces):
-        for right, right_z_um, right_region in horizontal_surfaces[index + 1 :]:
-            if abs(left_z_um - right_z_um) > 1e-9:
-                continue
-            if _regions_overlap(left_region, right_region):
+    for z_um, z_surfaces in surfaces_by_z.items():
+        ordered = sorted(z_surfaces, key=lambda item: item[2][0])
+        for index, (left, left_region, left_bounds) in enumerate(ordered):
+            for right, right_region, right_bounds in ordered[index + 1 :]:
+                if right_bounds[0] > left_bounds[2] + 1e-9:
+                    break
+                if not _bounds_overlap(left_bounds, right_bounds):
+                    continue
+                if not _regions_overlap(left_region, right_region):
+                    continue
                 errors.append(
-                    f"{left.surface_id} overlaps {right.surface_id} on z={left_z_um}"
+                    f"{left.surface_id} overlaps {right.surface_id} on z={z_um}"
                 )
+                break
+            if errors:
+                break
+        if errors:
+            break
     if errors:
         raise ValueError("Invalid surface overlap: " + "; ".join(errors))
 
@@ -683,14 +711,60 @@ def _horizontal_surface_region(
         region = tuple(gdstk.boolean((outer,), holes, "not", precision=1e-9) or ())
     else:
         region = (outer,)
-    return _geometry_ref_z_um(geometry_ref), region
+    return _geometry_ref_z_um(geometry_ref), tuple(
+        polygon
+        for polygon in region
+        if abs(float(polygon.area())) > _BOOLEAN_AREA_EPS_UM2
+    )
 
 
 def _regions_overlap(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
     import gdstk
 
     overlap = gdstk.boolean(left, right, "and", precision=1e-9) or ()
-    return any(abs(polygon.area()) > 1e-12 for polygon in overlap)
+    return any(abs(polygon.area()) > _BOOLEAN_AREA_EPS_UM2 for polygon in overlap)
+
+
+def _coordinate_2d_key(point: tuple[float, float]) -> tuple[float, float]:
+    return (round(float(point[0]), 9), round(float(point[1]), 9))
+
+
+def _skip_surface_overlap_validation(
+    surface: SurfacePlanRecord,
+    skip_owner_semantic_ids: set[str],
+) -> bool:
+    if not skip_owner_semantic_ids:
+        return False
+    owner_ids = {surface.owner_semantic_id}
+    for key in ("owner_semantic_ids", "boundary_volume_ids"):
+        raw = surface.metadata.get(key, ())
+        if isinstance(raw, str):
+            owner_ids.add(raw)
+        elif isinstance(raw, tuple | list | set):
+            owner_ids.update(str(value) for value in raw)
+    return bool(owner_ids & skip_owner_semantic_ids)
+
+
+def _region_bounds(region: tuple[Any, ...]) -> tuple[float, float, float, float]:
+    boxes = [polygon.bounding_box() for polygon in region]
+    return (
+        min(float(box[0][0]) for box in boxes),
+        min(float(box[0][1]) for box in boxes),
+        max(float(box[1][0]) for box in boxes),
+        max(float(box[1][1]) for box in boxes),
+    )
+
+
+def _bounds_overlap(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    return not (
+        left[2] <= right[0] + 1e-9
+        or right[2] <= left[0] + 1e-9
+        or left[3] <= right[1] + 1e-9
+        or right[3] <= left[1] + 1e-9
+    )
 
 
 def _clean_loop2d(loop: Any) -> tuple[tuple[float, float], ...]:
@@ -737,6 +811,104 @@ def _coordinate_signature(
     coordinate: tuple[float, float, float],
 ) -> tuple[float, float, float]:
     return tuple(round(float(value), 9) for value in coordinate)
+
+
+def _point_axis_index(
+    points_by_id: Mapping[str, PointPlanRecord],
+) -> tuple[tuple[tuple[float, ...], tuple[str, ...]], ...]:
+    indexes: list[tuple[tuple[float, ...], tuple[str, ...]]] = []
+    for axis in range(3):
+        items = sorted(
+            (
+                _coordinate_signature(point.coordinate)[axis],
+                point_id,
+            )
+            for point_id, point in points_by_id.items()
+        )
+        indexes.append(
+            (
+                tuple(value for value, _ in items),
+                tuple(point_id for _, point_id in items),
+            )
+        )
+    return tuple(indexes)
+
+
+def _axis_aligned_point_index(
+    points_by_id: Mapping[str, PointPlanRecord],
+) -> dict[tuple[int, tuple[float, float]], tuple[tuple[float, ...], tuple[str, ...]]]:
+    records: dict[
+        tuple[int, tuple[float, float]],
+        list[tuple[float, str]],
+    ] = {}
+    for point_id, point in points_by_id.items():
+        key = _coordinate_signature(point.coordinate)
+        for varying_axis in range(3):
+            fixed_key = tuple(
+                key[axis]
+                for axis in range(3)
+                if axis != varying_axis
+            )
+            records.setdefault((varying_axis, fixed_key), []).append(
+                (key[varying_axis], point_id)
+            )
+    return {
+        line_key: (
+            tuple(value for value, _ in sorted_items),
+            tuple(point_id for _, point_id in sorted_items),
+        )
+        for line_key, items in records.items()
+        for sorted_items in (tuple(sorted(items)),)
+    }
+
+
+def _segment_candidate_point_ids(
+    start: tuple[float, float, float],
+    end: tuple[float, float, float],
+    point_axis_index: tuple[tuple[tuple[float, ...], tuple[str, ...]], ...],
+    point_line_index: Mapping[
+        tuple[int, tuple[float, float]],
+        tuple[tuple[float, ...], tuple[str, ...]],
+    ],
+) -> tuple[str, ...]:
+    start_key = _coordinate_signature(start)
+    end_key = _coordinate_signature(end)
+    varying_axes = tuple(
+        axis
+        for axis in range(3)
+        if abs(start_key[axis] - end_key[axis]) > 1e-9
+    )
+    if len(varying_axes) == 1:
+        varying_axis = varying_axes[0]
+        fixed_key = tuple(
+            start_key[axis]
+            for axis in range(3)
+            if axis != varying_axis
+        )
+        values, point_ids = point_line_index.get(
+            (varying_axis, fixed_key),
+            ((), ()),
+        )
+        lower = min(start_key[varying_axis], end_key[varying_axis]) - 1e-9
+        upper = max(start_key[varying_axis], end_key[varying_axis]) + 1e-9
+        left = bisect_left(values, lower)
+        right = bisect_right(values, upper)
+        return point_ids[left:right]
+    bounds = tuple(
+        (
+            min(start_key[axis], end_key[axis]) - 1e-9,
+            max(start_key[axis], end_key[axis]) + 1e-9,
+        )
+        for axis in range(3)
+    )
+    ranges: list[tuple[int, int, int]] = []
+    for axis, (values, _) in enumerate(point_axis_index):
+        lower, upper = bounds[axis]
+        left = bisect_left(values, lower)
+        right = bisect_right(values, upper)
+        ranges.append((right - left, left, axis))
+    count, left, axis = min(ranges)
+    return point_axis_index[axis][1][left : left + count]
 
 
 def _point_on_segment_interior(

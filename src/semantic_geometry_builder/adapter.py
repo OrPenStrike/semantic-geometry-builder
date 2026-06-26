@@ -103,8 +103,12 @@ def build_gds_stack_geometry_input(
     if metadata is not None and not isinstance(metadata, Mapping):
         raise TypeError("metadata must be a mapping when provided")
 
+    effective_top_cell_name = top_cell_name or stack_metadata.get("top_cell_name")
     library = gdstk.read_gds(str(gds_path))
-    cell = _select_gds_cell(library, top_cell_name)
+    cell = _select_gds_cell(
+        library,
+        str(effective_top_cell_name) if effective_top_cell_name else None,
+    )
     cell_bounds = _cell_bounds_um(cell)
     polygons_by_layer = _polygons_by_layer(cell)
 
@@ -124,14 +128,14 @@ def build_gds_stack_geometry_input(
     }
 
     for record in raw_layers:
-        entity, entity_polygons = _entity_and_polygons_from_layer_record(
+        for entity, entity_polygons in _entities_and_polygons_from_layer_record(
             record,
             polygons_by_layer=polygons_by_layer,
             cell_bounds_um=cell_bounds,
             domain_bounds_by_semantic_id=domain_bounds_by_semantic_id,
-        )
-        polygons.extend(entity_polygons)
-        entities.append(entity)
+        ):
+            polygons.extend(entity_polygons)
+            entities.append(entity)
 
     combined_metadata = {
         **dict(stack_metadata),
@@ -573,13 +577,13 @@ def _solution_region_entity_from_record(
     )
 
 
-def _entity_and_polygons_from_layer_record(
+def _entities_and_polygons_from_layer_record(
     record: Any,
     *,
     polygons_by_layer: Mapping[tuple[int, int], tuple[Any, ...]],
     cell_bounds_um: Mapping[str, float],
     domain_bounds_by_semantic_id: Mapping[str, Mapping[str, Any]],
-) -> tuple[SemanticEntitySpec, tuple[LayoutPolygonSpec, ...]]:
+) -> tuple[tuple[SemanticEntitySpec, tuple[LayoutPolygonSpec, ...]], ...]:
     entity = _entity_from_layer_record(record)
     geometry_source = str(entity.geometry.get("geometry_source", "gds_polygon"))
     if geometry_source == "die_face_minus_ground_mask":
@@ -589,6 +593,9 @@ def _entity_and_polygons_from_layer_record(
             cell_bounds_um=cell_bounds_um,
             domain_bounds_by_semantic_id=domain_bounds_by_semantic_id,
         )
+        return (
+            (_entity_with_polygon_geometry(entity, entity_polygons), entity_polygons),
+        )
     elif geometry_source == "gds_polygon":
         entity_polygons = _gds_polygons_for_entity(
             entity,
@@ -597,8 +604,65 @@ def _entity_and_polygons_from_layer_record(
     else:
         entity_polygons = ()
 
+    if entity.geometry.get("split_polygons_as_entities"):
+        return tuple(
+            _split_polygon_entity(entity, polygon, index)
+            for index, polygon in enumerate(entity_polygons)
+        )
     entity = _entity_with_polygon_geometry(entity, entity_polygons)
-    return entity, entity_polygons
+    return ((entity, entity_polygons),)
+
+
+def _split_polygon_entity(
+    entity: SemanticEntitySpec,
+    polygon: LayoutPolygonSpec,
+    index: int,
+) -> tuple[SemanticEntitySpec, tuple[LayoutPolygonSpec, ...]]:
+    semantic_id = f"{entity.semantic_id}_{index:04d}"
+    split_polygon = LayoutPolygonSpec(
+        polygon_id=f"{semantic_id}__P0000",
+        layer=polygon.layer,
+        exterior=polygon.exterior,
+        holes=polygon.holes,
+        object_name=semantic_id,
+        net_name=polygon.net_name,
+        port_name=polygon.port_name,
+        metadata={
+            **dict(polygon.metadata),
+            "source_semantic_id": entity.semantic_id,
+            "split_polygon_index": index,
+        },
+    )
+    geometry = {
+        **dict(entity.geometry),
+        "outer_loop": split_polygon.exterior,
+        "hole_loops": split_polygon.holes,
+    }
+    metadata = {
+        **dict(entity.metadata),
+        "semantic_group_id": entity.semantic_id,
+        "split_polygon_index": index,
+    }
+    return (
+        SemanticEntitySpec(
+            semantic_id=semantic_id,
+            role=entity.role,
+            material_id=entity.material_id,
+            priority=entity.priority,
+            geometry_kind=entity.geometry_kind,
+            part_role=entity.part_role,
+            attached_face_metal_semantic_id=entity.attached_face_metal_semantic_id,
+            net_id=entity.net_id,
+            polygon_ids=(split_polygon.polygon_id,),
+            labels=entity.labels,
+            host_void_semantic_id=entity.host_void_semantic_id,
+            requires_construction_body=entity.requires_construction_body,
+            route_representations=entity.route_representations,
+            geometry=geometry,
+            metadata=metadata,
+        ),
+        (split_polygon,),
+    )
 
 
 def _entity_from_layer_record(record: Any) -> SemanticEntitySpec:
@@ -728,7 +792,7 @@ def _derived_ground_polygons(
         mask_key = (int(mask_layer[0]), int(mask_layer[1]))
     holes = tuple(
         _ring_from_gdstk_polygon(polygon)
-        for polygon in polygons_by_layer.get(mask_key, ())
+        for polygon in _merged_gdstk_polygons(polygons_by_layer.get(mask_key, ()))
     )
     exterior = _rectangle_ring(
         _ground_plane_bounds(entity, domain_bounds_by_semantic_id, cell_bounds_um)
@@ -748,6 +812,20 @@ def _derived_ground_polygons(
             },
         ),
     )
+
+
+def _merged_gdstk_polygons(polygons: Sequence[Any]) -> tuple[Any, ...]:
+    if not polygons:
+        return ()
+    import gdstk
+
+    merged = gdstk.boolean(
+        polygons,
+        (),
+        "or",
+        precision=1e-9,
+    )
+    return tuple(merged or ())
 
 
 def _ground_plane_bounds(
