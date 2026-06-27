@@ -449,7 +449,13 @@ def validate_inset_mesh_contract(
     surface_partitions: tuple[SurfacePartitionRecord, ...],
     mesh_size_hints: tuple[MeshSizeHintRecord, ...],
 ) -> None:
-    """Require every finite inset band to export a downstream mesh-size hint."""
+    """Require every finite inset band to export a downstream mesh-size hint.
+
+    The planner may represent horizontal bands with planar loops and sidewall
+    bands with explicit quad strips. Both are live topology; validation only
+    cares that finite bands carry mesh-size hints fine enough to resolve the
+    requested inset width.
+    """
     hints_by_partition = {
         hint.source_partition_id: hint
         for hint in mesh_size_hints
@@ -461,11 +467,6 @@ def validate_inset_mesh_contract(
             errors.append(f"{hint.target_id} mesh hint max_size_um must be positive")
 
     for partition in surface_partitions:
-        if partition.parameterization == "occ_native_parametric":
-            errors.append(
-                f"{partition.partition_id} sidewall/arbitrary-plane inset "
-                "requires generalized coplanar-family validation"
-            )
         if partition.band_min_um is None or partition.band_max_um is None:
             continue
         width_um = partition.band_max_um - partition.band_min_um

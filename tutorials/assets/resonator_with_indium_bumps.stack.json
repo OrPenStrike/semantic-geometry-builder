@@ -3,7 +3,7 @@
     "schema": "semantic_geometry_stack_v1",
     "units": "um",
     "source": "tutorials/assets/resonator_with_indium_bumps.gds",
-    "top_cell_name": "resonator_with_indium_bumps_RL4000_RM6_BFP360_IBS20_IBG_ab09c4a0",
+    "top_cell_name": "resonator_with_indium_bumps_fixture",
     "source_pdk": "orpen_sc_pdk",
     "source_cell": "orpen_sc_pdk.cells.chips.resonator_with_indium_bumps",
     "notes": [

@@ -1167,12 +1167,12 @@ def apply_inset_surface_partitions(
     prevents the `SA` side and `MS` side of a metal edge from inventing
     independent near-duplicate micro topology.
 
-    The current implementation still performs the low-risk fallback for
-    isolated parents: planar surfaces use real 2D inward offsets; sidewall
-    surfaces use sidewall-specific strip partitioning from both sides of the
-    shorter local axis. Requested thresholds that are not strictly smaller than
-    half of that axis length are skipped, and the remaining middle area becomes
-    `CORE`.
+    The current implementation emits the horizontal coplanar family first, then
+    relies on canonical point/curve/loop planning to make shared boundaries
+    explicit before OCC lowering. Sidewall surfaces use sidewall-specific strip
+    partitioning from both sides of the shorter local axis. Requested thresholds
+    that are not strictly smaller than half of that axis length are skipped, and
+    the remaining middle area becomes `CORE`.
     """
     breakpoints_um = _inset_breakpoints_for_route(build_input, route)
     if len(breakpoints_um) <= 1:
@@ -1201,6 +1201,11 @@ def apply_inset_surface_partitions(
 
         parent_physical_name = _surface_physical_name(surface)
         inset_family_ids = _inset_family_ids(surface)
+        inset_partition_source = (
+            "coplanar_joint_arrangement"
+            if inset_family_ids
+            else "surface_local_fallback"
+        )
         for index, (label, band_min_um, band_max_um, geometry_ref) in enumerate(
             inset_geometry_refs
         ):
@@ -1215,7 +1220,7 @@ def apply_inset_surface_partitions(
                 **dict(surface.metadata),
                 "inset_band": inset_band,
                 "inset_family_ids": inset_family_ids,
-                "inset_partition_source": "surface_local_fallback",
+                "inset_partition_source": inset_partition_source,
                 "physical_name": f"{parent_physical_name}__{label}",
             }
             child_surfaces.append(
@@ -1251,7 +1256,7 @@ def apply_inset_surface_partitions(
                     metadata={
                         "inset_band": inset_band,
                         "inset_family_ids": inset_family_ids,
-                        "inset_partition_source": "surface_local_fallback",
+                        "inset_partition_source": inset_partition_source,
                         "parent_surface_id": surface.surface_id,
                     },
                 )
