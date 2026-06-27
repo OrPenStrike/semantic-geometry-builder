@@ -1,0 +1,108 @@
+"""Stage-oriented model package for Semantic Geometry Builder.
+
+The public import path stays `semantic_geometry_builder.models`. Internally the
+records are grouped by pipeline handoff so future stages can grow without
+turning one file into another catch-all.
+"""
+
+from semantic_geometry_builder.models.common import (
+    DEFAULT_INTERFACE_SOLVER_USE,
+    HIGH_COUNT_LOCAL_CONDUCTOR_PART_ROLES,
+    ROUTE_ALLOWED_REPRESENTATIONS,
+    RUN_METADATA_DIR,
+    SEMANTIC_GEOMETRY_METADATA_DIR,
+    ConductorPartRoleLiteral,
+    ConductorRepresentationLiteral,
+    Coordinate,
+    CurveKindLiteral,
+    CurveOrientationLiteral,
+    DimensionLiteral,
+    GmshDimTag,
+    InsetPartitionSourceLiteral,
+    InterfaceKindLiteral,
+    PathInput,
+    PolygonRing,
+    RouteLiteral,
+    SolverUseLiteral,
+    SurfaceLoopRoleLiteral,
+    SurfaceOrientationLiteral,
+    SurfaceParameterizationKindLiteral,
+    SurfacePartitionApplicationModeLiteral,
+    TagSourceKindLiteral,
+    Vector3D,
+)
+from semantic_geometry_builder.models.construction import (
+    ConstructionBodyPlanRecord,
+    ConstructionPlanRecord,
+    CoplanarInsetFamilyRecord,
+    CutHostOperationRecord,
+    MeshSizeHintRecord,
+    SurfacePartitionRecord,
+)
+from semantic_geometry_builder.models.input import (
+    GeometryBuildInput,
+    LayoutPolygonSpec,
+    SemanticEntitySpec,
+)
+from semantic_geometry_builder.models.tags import (
+    BackendEntityTagRecord,
+    FinalPhysicalGroupRecord,
+    TagPlanRecord,
+)
+from semantic_geometry_builder.models.topology import (
+    CurvePlanRecord,
+    CurveRefRecord,
+    InterfacePlanRecord,
+    PointPlanRecord,
+    SurfaceLoopRecord,
+    SurfacePlanRecord,
+    SurfaceRefRecord,
+    VolumePlanRecord,
+)
+
+__all__ = [
+    "DEFAULT_INTERFACE_SOLVER_USE",
+    "HIGH_COUNT_LOCAL_CONDUCTOR_PART_ROLES",
+    "ROUTE_ALLOWED_REPRESENTATIONS",
+    "RUN_METADATA_DIR",
+    "SEMANTIC_GEOMETRY_METADATA_DIR",
+    "BackendEntityTagRecord",
+    "ConductorPartRoleLiteral",
+    "ConductorRepresentationLiteral",
+    "ConstructionBodyPlanRecord",
+    "ConstructionPlanRecord",
+    "Coordinate",
+    "CoplanarInsetFamilyRecord",
+    "CurveKindLiteral",
+    "CurveOrientationLiteral",
+    "CurvePlanRecord",
+    "CurveRefRecord",
+    "CutHostOperationRecord",
+    "DimensionLiteral",
+    "FinalPhysicalGroupRecord",
+    "GeometryBuildInput",
+    "GmshDimTag",
+    "InsetPartitionSourceLiteral",
+    "InterfaceKindLiteral",
+    "InterfacePlanRecord",
+    "LayoutPolygonSpec",
+    "MeshSizeHintRecord",
+    "PathInput",
+    "PointPlanRecord",
+    "PolygonRing",
+    "RouteLiteral",
+    "SemanticEntitySpec",
+    "SolverUseLiteral",
+    "SurfaceLoopRecord",
+    "SurfaceLoopRoleLiteral",
+    "SurfaceOrientationLiteral",
+    "SurfaceParameterizationKindLiteral",
+    "SurfacePartitionApplicationModeLiteral",
+    "SurfacePartitionRecord",
+    "SurfacePlanRecord",
+    "SurfaceRefRecord",
+    "TagPlanRecord",
+    "TagSourceKindLiteral",
+    "Vector3D",
+    "VolumePlanRecord",
+]

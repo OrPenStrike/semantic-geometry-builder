@@ -1,9 +1,9 @@
-"""Fail-fast invariants for semantic geometry plans.
+"""Fail-fast invariants used by the semantic geometry compiler.
 
-These are compiler checks, not backend repair passes. Pre-lowering validation
-must catch duplicate points/curves/surfaces, T-junctions, missing interface
-sources, bad volume closure, impossible surface use counts, and invalid tag
-ledger mappings before Gmsh/OCC is asked to materialize anything.
+This module owns ordinary input and plan checks: it rejects invalid route
+contracts before the backend is allowed to lower them. The named Engine Gate
+artifacts live in `engine_gates.py`, because those reports are the
+machine-checkable evidence SGB uses before claiming conformal geometry.
 """
 
 from __future__ import annotations
@@ -220,7 +220,14 @@ def validate_curve_plan_coverage(
     surface_loops: tuple[SurfaceLoopRecord, ...],
     surfaces: tuple[SurfacePlanRecord, ...],
 ) -> None:
-    """Validate canonical curve/loop references when the plan provides them."""
+    """Validate compiler-owned point, curve, and surface-loop topology.
+
+    Each `SurfaceLoopRecord` must be one simple directed cycle: holes are
+    separate loops, and shared curves are legal across different surfaces or
+    loops but may not repeat inside one loop. This is the pre-OCC contract that
+    keeps self-touching boolean output from reaching backend curve-loop
+    lowering.
+    """
     errors: list[str] = []
     if any(not surface.construction_only for surface in surfaces) and (
         not points or not curves or not surface_loops
@@ -305,12 +312,30 @@ def validate_curve_plan_coverage(
         if len(loop.curve_refs) < 3:
             errors.append(f"{loop.loop_id} requires at least three curves")
             continue
+        repeated_curve_refs = sorted(
+            curve_id
+            for curve_id, count in Counter(
+                curve_ref.curve_id for curve_ref in loop.curve_refs
+            ).items()
+            if count > 1
+        )
+        if repeated_curve_refs:
+            errors.append(
+                f"{loop.loop_id} repeats curve refs inside one surface loop: "
+                f"{repeated_curve_refs!r}"
+            )
         directed_edges: list[tuple[str, str]] = []
         for curve_ref in loop.curve_refs:
             curve = curves_by_id.get(curve_ref.curve_id)
             if curve is None:
                 errors.append(
                     f"{loop.loop_id} references unknown curve {curve_ref.curve_id}"
+                )
+                continue
+            if curve_ref.orientation not in {-1, 1}:
+                errors.append(
+                    f"{loop.loop_id} curve {curve_ref.curve_id} has invalid "
+                    f"orientation {curve_ref.orientation!r}"
                 )
                 continue
             if curve_ref.orientation == 1:
@@ -322,6 +347,20 @@ def validate_curve_plan_coverage(
             if end_point_id != next_start_id:
                 errors.append(f"{loop.loop_id} curve refs do not form a closed loop")
                 break
+        if len(directed_edges) == len(loop.curve_refs):
+            point_use_counts: Counter[str] = Counter()
+            for start_point_id, end_point_id in directed_edges:
+                point_use_counts.update((start_point_id, end_point_id))
+            bad_point_use_counts = {
+                point_id: count
+                for point_id, count in point_use_counts.items()
+                if count != 2
+            }
+            if bad_point_use_counts:
+                errors.append(
+                    f"{loop.loop_id} is not a simple surface loop; point use "
+                    f"counts {bad_point_use_counts!r}"
+                )
 
     for surface in surfaces:
         if surface.construction_only:
@@ -417,6 +456,14 @@ def validate_no_surface_overlap(
         for z_um, region in (_horizontal_surface_region(surface),)
         if region
     )
+    outer_loop_signatures = {
+        surface.surface_id: _loop2d_signature(surface.geometry_ref.get("outer_loop"))
+        for surface, _, _, _ in horizontal_surfaces
+    }
+    known_hole_signatures = {
+        surface.surface_id: _known_hole_signatures(surface)
+        for surface, _, _, _ in horizontal_surfaces
+    }
     surfaces_by_z = {}
     for surface, z_um, region, bounds in horizontal_surfaces:
         surfaces_by_z.setdefault(round(z_um, 9), []).append((surface, region, bounds))
@@ -429,6 +476,16 @@ def validate_no_surface_overlap(
                 if right_bounds[0] > left_bounds[2] + 1e-9:
                     break
                 if not _bounds_overlap(left_bounds, right_bounds):
+                    continue
+                left_outer = outer_loop_signatures[left.surface_id]
+                right_outer = outer_loop_signatures[right.surface_id]
+                if (
+                    left_outer is not None
+                    and left_outer in known_hole_signatures[right.surface_id]
+                ) or (
+                    right_outer is not None
+                    and right_outer in known_hole_signatures[left.surface_id]
+                ):
                     continue
                 if not _regions_overlap(left_region, right_region):
                     continue
@@ -774,6 +831,25 @@ def _regions_overlap(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
 
     overlap = gdstk.boolean(left, right, "and", precision=1e-9) or ()
     return any(abs(polygon.area()) > _BOOLEAN_AREA_EPS_UM2 for polygon in overlap)
+
+
+def _known_hole_signatures(
+    surface: SurfacePlanRecord,
+) -> set[tuple[tuple[float, float], ...]]:
+    geometry_ref = surface.geometry_ref
+    return {
+        signature
+        for key in ("hole_loops", "contact_hole_loops")
+        for loop in geometry_ref.get(key, ())
+        for signature in (_loop2d_signature(loop),)
+        if signature is not None
+    }
+
+
+def _loop2d_signature(loop: Any) -> tuple[tuple[float, float], ...] | None:
+    if loop is None:
+        return None
+    return tuple(sorted(_coordinate_2d_key(point) for point in _clean_loop2d(loop)))
 
 
 def _coordinate_2d_key(point: tuple[float, float]) -> tuple[float, float]:

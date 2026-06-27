@@ -3,7 +3,7 @@
     "schema": "semantic_geometry_stack_v1",
     "units": "um",
     "source": "tutorials/assets/sim_flip_chip_distance.gds",
-    "top_cell_name": "sim_flip_chip_distance_CCW9900_CCH9900_QCW7500_QCH7500__8b338b3b",
+    "top_cell_name": "sim_flip_chip_distance_fixture",
     "source_pdk": "orpen_sc_pdk",
     "source_cell": "orpen_sc_pdk.cells.flip_chip.sim_flip_chip_distance",
     "notes": [

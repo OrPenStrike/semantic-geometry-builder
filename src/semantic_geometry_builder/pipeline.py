@@ -1,9 +1,9 @@
 """Public route-aware semantic geometry pipeline facade.
 
-The heavy semantic work lives in `planning.py` and `validation.py`. This module
-keeps the public import path stable and owns only run orchestration: validate,
-plan, write sidecars, hand the plan to the bottom-up OCC backend, then export
-physical groups.
+The heavy semantic work lives in `planning.py`, `engine_gates.py`, and
+`validation.py`. This module keeps the public import path stable and owns only
+run orchestration: validate, plan, write sidecars, run Engine Gates, hand the
+plan to the bottom-up OCC backend, then export physical groups.
 """
 
 from __future__ import annotations
@@ -16,6 +16,11 @@ from typing import Any
 
 from semantic_geometry_builder.backends.gmsh_occ_backend import (
     write_occ_geometry_from_plan,
+)
+from semantic_geometry_builder.engine_gates import (
+    assert_engine_gate_pass,
+    engine_gate_2d_inset_coverage,
+    engine_gate_volume_adjacency_conformality,
 )
 from semantic_geometry_builder.export import export_physical_group_records
 from semantic_geometry_builder.models import (
@@ -97,8 +102,11 @@ class SemanticGeometryBuilder:
 
     1. validate the adapter-owned `GeometryBuildInput`;
     2. build a route-specific `ConstructionPlanRecord`;
-    3. call the bottom-up Gmsh/OCC backend with that plan;
-    4. export `FinalPhysicalGroupRecord`s from backend dim-tags.
+    3. write pre-lowering Engine Gate artifacts for inset coverage and volume
+       adjacency;
+    4. call the bottom-up Gmsh/OCC backend with that plan;
+    5. write the post-lowering Gmsh BRep Engine Gate artifact;
+    6. export `FinalPhysicalGroupRecord`s from backend dim-tags.
 
     One call writes one route XAO file. Mesh generation is downstream.
     """
@@ -155,6 +163,44 @@ class SemanticGeometryBuilder:
                     plan,
                 ),
             )
+            inset_gate = _timed(
+                timings,
+                "engine_gate_2d_inset_coverage",
+                lambda: engine_gate_2d_inset_coverage(plan),
+            )
+            _timed(
+                timings,
+                "write_engine_gate_2d_inset_coverage",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "engine_gate_2d_inset_coverage",
+                    inset_gate,
+                ),
+            )
+            _timed(
+                timings,
+                "assert_engine_gate_2d_inset_coverage",
+                lambda: assert_engine_gate_pass(inset_gate),
+            )
+            volume_adjacency_gate = _timed(
+                timings,
+                "engine_gate_volume_adjacency_conformality",
+                lambda: engine_gate_volume_adjacency_conformality(plan),
+            )
+            _timed(
+                timings,
+                "write_engine_gate_volume_adjacency_conformality",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "engine_gate_volume_adjacency_conformality",
+                    volume_adjacency_gate,
+                ),
+            )
+            _timed(
+                timings,
+                "assert_engine_gate_volume_adjacency_conformality",
+                lambda: assert_engine_gate_pass(volume_adjacency_gate),
+            )
 
             built_plan = _timed(
                 timings,
@@ -175,6 +221,23 @@ class SemanticGeometryBuilder:
                     "03_build_occ_geometry",
                     built_plan,
                 ),
+            )
+            gmsh_brep_gate = built_plan.metadata.get(
+                "engine_gate_gmsh_brep_conformality"
+            )
+            _timed(
+                timings,
+                "write_engine_gate_gmsh_brep_conformality",
+                lambda: _write_stage_sidecar(
+                    metadata_dir,
+                    "engine_gate_gmsh_brep_conformality",
+                    gmsh_brep_gate,
+                ),
+            )
+            _timed(
+                timings,
+                "assert_engine_gate_gmsh_brep_conformality",
+                lambda: assert_engine_gate_pass(gmsh_brep_gate),
             )
 
             _timed(

@@ -25,9 +25,10 @@ physical names, and metadata/audit records.
 Read the package in this order:
 
 1. Folder structure: `adapter.py` lowers frontend files into
-   `GeometryBuildInput`; `models.py` defines the records; `planning.py` turns
-   records into a route-specific construction plan; `backends/` builds the OCC
-   model; `export.py` projects backend tags back to physical groups.
+   `GeometryBuildInput`; `models/` defines the stage handoff records;
+   `planning.py` turns records into a route-specific construction plan;
+   `backends/` builds the OCC model; `export.py` projects backend tags back to
+   physical groups.
 2. Models: `InterfacePlanRecord`, `SurfacePartitionRecord`,
    `SurfacePlanRecord`, `VolumePlanRecord`, `ConstructionBodyPlanRecord`,
    `CutHostOperationRecord`, and `TagPlanRecord` are the metadata ladder from
@@ -120,12 +121,67 @@ strategy, and it must not be the mechanism that assigns semantic identity.
 `sewing=True` and `removeAllDuplicates()` are also outside the v1 correctness
 path; they hide missing canonical topology instead of proving it.
 
-Validation is split in two. Pre-lowering validation checks canonical points,
-curves, loops, surfaces, interface coverage, volume closure, surface use
-counts, and tag references without asking Gmsh to repair anything.
-Post-lowering audit checks that OCC boundaries and physical groups match the
-planned ids. Meshability may be checked in memory as an audit gate, but this
-package still does not write `.msh` files.
+Conformal geometry is an engine claim, not a visual or physical-name claim.
+In this project, "geometry is conformal" means the SGB engine can prove three
+machine-checkable facts before downstream solvers see the model:
+
+1. 2D inset coverage: child ring/core surfaces exactly cover their logical
+   parent surface, with no area overlap, no gap, and no below-tolerance sliver.
+2. Gmsh BRep conformality: adjacent child surfaces share live Gmsh topology
+   tags, especially boundary curve tags, instead of merely placing coincident
+   curves at the same coordinates.
+3. Volume adjacency conformality: every live surface has legal volume
+   incidence. Exterior surfaces are used by one volume, retained internal
+   interfaces are shared by two volumes, construction-only/logical surfaces are
+   not solver-active, and no surface is used by more than two volumes.
+
+These checks are **Engine Gates**. They are stricter than ordinary input
+validation because they decide whether SGB can claim solver-ready conformal
+geometry. Pre-lowering engine gates check canonical points, curves, loops,
+surfaces, interface coverage, volume closure, surface use counts, and tag
+references without asking Gmsh to repair anything. Post-lowering engine gates
+must check that OCC boundaries, shared curve tags, volume boundary surfaces,
+and physical groups still match the planned ids. Downstream mesh topology
+checks in gsim, such as zero-volume tetrahedra and face incidence greater than
+two, are a fourth gate outside SGB.
+
+For investigation only, SGB also ships a diagnostic Mesh Gate module that can
+open an existing SGB XAO and sidecar, run gsim-like mesh smoke profiles, and
+write `mesh_gate_<profile>.json` reports. This is not part of the formal
+`SemanticGeometryBuilder.build()` contract and it does not write Palace
+`config.json`.
+
+The intended SGB engine-gate artifacts are:
+
+```text
+metadata/semantic_geometry/
+    engine_gate_2d_inset_coverage.json
+    engine_gate_gmsh_brep_conformality.json
+    engine_gate_volume_adjacency_conformality.json
+    mesh_gate_gsim_default.json        # optional diagnostic
+    mesh_gate_hxt_10.json              # optional diagnostic
+```
+
+Each artifact should be machine-checkable and shaped like:
+
+```json
+{
+  "schema": "sgb.engine_gate.v1",
+  "engine_gate": "2d_inset_coverage",
+  "stage": "after_build_route_construction_plan",
+  "status": "pass",
+  "tolerances": {
+    "coordinate_um": 1e-9,
+    "area_um2": 1e-8
+  },
+  "failures": [],
+  "records": []
+}
+```
+
+Until these Engine Gate artifacts pass for a route output, a generated XAO
+should be treated as buildable/reviewable geometry, not as proven
+solver-ready conformal geometry.
 
 Current source layers:
 
@@ -140,16 +196,23 @@ Current source layers:
 - `src/semantic_geometry_builder/planning.py`: route-first interface,
   surface-partition, canonical point/curve/surface-loop, construction-body,
   volume, cut-operation, and tag plans.
-- `src/semantic_geometry_builder/validation.py`: fail-fast input and plan
-  invariants.
+- `src/semantic_geometry_builder/engine_gates.py`: named Engine Gate artifact
+  builders for conformal-geometry claims.
+- `src/semantic_geometry_builder/mesh_gate.py`: optional diagnostic runner for
+  gsim-default and HXT/10 tetra topology smoke gates on an exported XAO.
+- `src/semantic_geometry_builder/validation.py`: ordinary fail-fast input and
+  plan invariants used before Engine Gates and backend lowering.
 - `src/semantic_geometry_builder/export.py`: backend dim-tag to physical-group
   record conversion.
 - `src/semantic_geometry_builder/backends/`: backend construction. The v1
   backend consumes planned point/curve/surface-loop/surface/volume records and
   writes one route XAO file; it does not discover interfaces through global
   fragment operations.
-- `src/semantic_geometry_builder/models.py`: layout-tool-agnostic records,
-  type aliases, and small contract guards.
+- `src/semantic_geometry_builder/models/`: stage handoff records. `common.py`
+  owns aliases/constants, `input.py` owns adapter IR, `topology.py` owns
+  interface/surface/volume topology records, `construction.py` owns route
+  construction-plan records, and `tags.py` owns physical-group/tag ledger
+  records. `models/__init__.py` keeps the public import path stable.
 
 ## Run Folder Contract
 
@@ -178,6 +241,24 @@ physical-group export. They may reference optional geometry snapshots, but they
 must not become Palace config, mesh generation output, or solver result files.
 Downstream consumers can read these sidecars when building manifests, assigning
 backend physical groups, or generating solver config.
+
+After a build writes `geometry/semantic_geometry_route_<route>.xao`, run the
+diagnostic Mesh Gate when investigating mesh-safe conformality:
+
+```bash
+python -m semantic_geometry_builder.mesh_gate --run-folder <run_folder> --route B
+```
+
+The default run validates two profiles:
+
+- `gsim_default`: gsim default mesh sizes, boundary Distance/Threshold field,
+  `Mesh.Algorithm = 5`, and no 3D algorithm override.
+- `hxt_10`: the same mesh-size/refinement setup plus `Mesh.Algorithm3D = 10`
+  and ten Gmsh mesh threads for the HXT path.
+
+The reports fail on missing/stale physical groups, zero-volume tetrahedra, or
+tetra faces shared by more than two tetrahedra. Palace config and AMR entry are
+still downstream gsim/Palace checks.
 
 The geometry artifact for one `build()` call is the route XAO file. Physical
 groups must be attached before that XAO is written, using the physical names

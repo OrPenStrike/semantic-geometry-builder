@@ -222,6 +222,7 @@ def build_route_construction_plan(
             construction_bodies=construction_bodies,
         ),
     )
+    pre_inset_surfaces = surfaces
     surfaces, generated_surface_partitions = _timed(
         timings,
         "apply_inset_surface_partitions",
@@ -232,6 +233,10 @@ def build_route_construction_plan(
         ),
     )
     surface_partitions = (*surface_partitions, *generated_surface_partitions)
+    inset_parent_geometry_refs = _inset_parent_geometry_refs(
+        parent_surfaces=pre_inset_surfaces,
+        generated_partitions=generated_surface_partitions,
+    )
     coplanar_inset_families = _timed(
         timings,
         "plan_coplanar_inset_families",
@@ -393,9 +398,27 @@ def build_route_construction_plan(
         metadata={
             "backend_strategy": "surface_plan_first_bottom_up_occ",
             "fragment_first_disabled": True,
+            "inset_parent_geometry_refs": inset_parent_geometry_refs,
             "timings": timings,
         },
     )
+
+
+def _inset_parent_geometry_refs(
+    *,
+    parent_surfaces: tuple[SurfacePlanRecord, ...],
+    generated_partitions: tuple[SurfacePartitionRecord, ...],
+) -> dict[str, Mapping[str, Any]]:
+    parent_ids = {
+        str(partition.metadata.get("parent_surface_id", ""))
+        for partition in generated_partitions
+        if partition.metadata.get("parent_surface_id")
+    }
+    return {
+        surface.surface_id: dict(surface.geometry_ref)
+        for surface in parent_surfaces
+        if surface.surface_id in parent_ids
+    }
 
 
 def _timed(

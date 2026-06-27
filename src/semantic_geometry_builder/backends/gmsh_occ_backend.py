@@ -86,6 +86,9 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from semantic_geometry_builder.engine_gates import (
+    engine_gate_gmsh_brep_conformality,
+)
 from semantic_geometry_builder.models import (
     BackendEntityTagRecord,
     ConstructionPlanRecord,
@@ -230,6 +233,13 @@ def write_occ_geometry_from_plan(
 
         with _debug_stage(debug_logging, "synchronize OCC model", timings):
             gmsh.model.occ.synchronize()
+        with _debug_stage(debug_logging, "engine gate gmsh_brep_conformality", timings):
+            gmsh_brep_gate = engine_gate_gmsh_brep_conformality(
+                plan,
+                gmsh=gmsh,
+                source_tags=source_tags,
+                curve_tags=curve_tags,
+            )
         backend_tags = _backend_entity_tags(source_tags)
         grouped_tag_plans = _group_tag_plans(plan.tags)
         with _debug_stage(
@@ -262,6 +272,7 @@ def write_occ_geometry_from_plan(
                 **dict(plan.metadata),
                 "xao_path": str(xao_path),
                 "backend_timings": timings,
+                "engine_gate_gmsh_brep_conformality": gmsh_brep_gate,
             },
         )
     finally:
