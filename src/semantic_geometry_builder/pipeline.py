@@ -163,6 +163,12 @@ class SemanticGeometryBuilder:
                     plan,
                 ),
             )
+            if plan.port_sheet_regions:
+                raise NotImplementedError(
+                    "Palace lumped-port sheet local fragment lowering is not "
+                    "implemented; 02_build_route_construction_plan.json contains "
+                    "the explicit port_sheet_regions contract."
+                )
             inset_gate = _timed(
                 timings,
                 "engine_gate_2d_inset_coverage",

@@ -89,6 +89,7 @@ from __future__ import annotations
 
 import time
 from bisect import bisect_left, bisect_right
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from math import sqrt
@@ -394,10 +395,22 @@ def build_route_construction_plan(
         volumes=volumes,
         construction_bodies=construction_bodies,
         cut_operations=cut_operations,
+        port_sheet_regions=build_input.port_sheet_regions,
         tags=tags,
         metadata={
             "backend_strategy": "surface_plan_first_bottom_up_occ",
             "fragment_first_disabled": True,
+            "port_sheet_region_layer": {
+                "source": "GeometryBuildInput.port_sheet_regions",
+                "backend_live_surface_records": False,
+                "allowed_overlap": "palace_lumped_port_sheet_only",
+                "lowering_status": (
+                    "not_lowered_by_sgb_backend"
+                    if build_input.port_sheet_regions
+                    else "none"
+                ),
+                "future_operation": "local_occ_fragment_per_overlap",
+            },
             "inset_parent_geometry_refs": inset_parent_geometry_refs,
             "timings": timings,
         },
@@ -4063,12 +4076,87 @@ def _range_within_bounds(
 
 
 def _clean_loop(loop: Any) -> tuple[tuple[float, float], ...]:
-    points = tuple((float(point[0]), float(point[1])) for point in loop)
+    points = tuple(
+        _coordinate_2d_key((float(point[0]), float(point[1])))
+        for point in loop
+    )
     if len(points) > 1 and points[0] == points[-1]:
         points = points[:-1]
+    points = _drop_near_duplicate_loop_points(points)
+    points = _drop_redundant_collinear_loop_points(points)
     if len(points) < 3:
         raise ValueError("loop requires at least 3 unique points")
+    if abs(_polygon_area(points)) <= _INSET_EPS_UM:
+        raise ValueError("loop area is below topology tolerance")
     return points
+
+
+def _drop_near_duplicate_loop_points(
+    points: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...]:
+    cleaned: list[tuple[float, float]] = []
+    for point in points:
+        if cleaned and cleaned[-1] == point:
+            continue
+        cleaned.append(point)
+    if len(cleaned) > 1 and cleaned[0] == cleaned[-1]:
+        cleaned.pop()
+    return tuple(cleaned)
+
+
+def _drop_redundant_collinear_loop_points(
+    points: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...]:
+    points = _drop_near_duplicate_loop_points(points)
+    if len(points) <= 3:
+        return points
+
+    protected = _duplicate_edge_point_indices(points)
+    changed = True
+    while changed and len(points) > 3:
+        changed = False
+        for index, point in enumerate(points):
+            if index in protected:
+                continue
+            previous = points[index - 1]
+            following = points[(index + 1) % len(points)]
+            if _point_on_segment_2d(point, previous, following):
+                points = points[:index] + points[index + 1 :]
+                protected = _duplicate_edge_point_indices(points)
+                changed = True
+                break
+    return points
+
+
+def _duplicate_edge_point_indices(
+    points: tuple[tuple[float, float], ...],
+) -> set[int]:
+    edge_counts = Counter(
+        tuple(sorted((start, end)))
+        for start, end in _ring_edges(points)
+    )
+    protected: set[int] = set()
+    for index, edge in enumerate(_ring_edges(points)):
+        if edge_counts[tuple(sorted(edge))] > 1:
+            protected.update((index, (index + 1) % len(points)))
+    return protected
+
+
+def _point_on_segment_2d(
+    point: tuple[float, float],
+    start: tuple[float, float],
+    end: tuple[float, float],
+) -> bool:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= _INSET_EPS_UM * _INSET_EPS_UM:
+        return False
+    cross = (point[0] - start[0]) * dy - (point[1] - start[1]) * dx
+    if abs(cross) > _INSET_EPS_UM * sqrt(length_sq):
+        return False
+    dot = (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
+    return _INSET_EPS_UM < dot < length_sq - _INSET_EPS_UM
 
 
 def _ring_edges(
@@ -4578,9 +4666,82 @@ def _geometry_ref_from_gdstk_polygon(
     polygon: Any,
 ) -> dict[str, Any]:
     geometry_ref = dict(parent_geometry_ref)
-    geometry_ref["outer_loop"] = _clean_loop(polygon.points)
-    geometry_ref["hole_loops"] = ()
+    outer_loop, hole_loops = _split_gdstk_cutline_loop(_clean_loop(polygon.points))
+    geometry_ref["outer_loop"] = outer_loop
+    geometry_ref["hole_loops"] = hole_loops
     return geometry_ref
+
+
+def _split_gdstk_cutline_loop(
+    loop: tuple[tuple[float, float], ...],
+) -> tuple[
+    tuple[tuple[float, float], ...],
+    tuple[tuple[tuple[float, float], ...], ...],
+]:
+    """Normalize gdstk's single cutline hole encoding into explicit loops.
+
+    gdstk can encode one hole as a self-touching polygon with one reversed
+    duplicate edge. Unsupported repeated-edge forms intentionally fall through
+    so canonical topology validation can reject them instead of guessing.
+    """
+    duplicate_edges: dict[
+        tuple[tuple[float, float], tuple[float, float]],
+        list[int],
+    ] = {}
+    for index, (start, end) in enumerate(_ring_edges(loop)):
+        edge_key = tuple(sorted((_coordinate_2d_key(start), _coordinate_2d_key(end))))
+        duplicate_edges.setdefault(edge_key, []).append(index)
+    repeated = [indices for indices in duplicate_edges.values() if len(indices) > 1]
+    if not repeated:
+        return loop, ()
+    if len(repeated) != 1 or len(repeated[0]) != 2:
+        return loop, ()
+
+    first, second = repeated[0]
+    first_start, first_end = loop[first], loop[(first + 1) % len(loop)]
+    second_start, second_end = loop[second], loop[(second + 1) % len(loop)]
+    if _coordinate_2d_key(first_start) != _coordinate_2d_key(
+        second_end,
+    ) or _coordinate_2d_key(first_end) != _coordinate_2d_key(second_start):
+        return loop, ()
+
+    first_loop = _clean_cutline_loop(loop[first + 1 : second + 1])
+    second_loop = _clean_cutline_loop(loop[second + 1 :] + loop[: first + 1])
+    if _loop_has_repeated_points_or_edges(
+        first_loop,
+    ) or _loop_has_repeated_points_or_edges(second_loop):
+        return loop, ()
+
+    loops = sorted(
+        (first_loop, second_loop),
+        key=lambda candidate: abs(_polygon_area(candidate)),
+        reverse=True,
+    )
+    return loops[0], (loops[1],)
+
+
+def _clean_cutline_loop(
+    loop: tuple[tuple[float, float], ...],
+) -> tuple[tuple[float, float], ...]:
+    points = _clean_loop(loop)
+    if len(points) > 3 and _coordinate_2d_key(points[0]) == _coordinate_2d_key(
+        points[-1],
+    ):
+        return points[:-1]
+    return points
+
+
+def _loop_has_repeated_points_or_edges(
+    loop: tuple[tuple[float, float], ...],
+) -> bool:
+    point_count = len({_coordinate_2d_key(point) for point in loop})
+    if point_count != len(loop):
+        return True
+    edge_count = {
+        tuple(sorted((_coordinate_2d_key(start), _coordinate_2d_key(end))))
+        for start, end in _ring_edges(loop)
+    }
+    return len(edge_count) != len(loop)
 
 
 def _geometry_refs_from_gdstk_region(

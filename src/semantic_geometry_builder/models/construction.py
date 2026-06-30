@@ -17,6 +17,7 @@ from semantic_geometry_builder.models.common import (
     SurfaceParameterizationKindLiteral,
     SurfacePartitionApplicationModeLiteral,
 )
+from semantic_geometry_builder.models.regions import PortSheetRegionRecord
 from semantic_geometry_builder.models.tags import BackendEntityTagRecord, TagPlanRecord
 from semantic_geometry_builder.models.topology import (
     CurvePlanRecord,
@@ -147,7 +148,8 @@ class ConstructionPlanRecord:
     features, `points`, `curves`, and `surface_loops` make shared topology
     canonical, `surfaces` and `volumes` describe geometry to build,
     `construction_bodies` and `cut_operations` describe Route A/B host cuts,
-    and `tags` define physical names before backend dim-tags exist.
+    `port_sheet_regions` carry explicit 2D lumped-port overlap intent, and
+    `tags` define physical names before backend dim-tags exist.
 
     After OCC construction, the backend returns the same plan with
     `backend_entity_tags` populated. `FinalPhysicalGroupRecord`s are then a
@@ -169,4 +171,4 @@ class ConstructionPlanRecord:
     tags: tuple[TagPlanRecord, ...] = ()
     backend_entity_tags: tuple[BackendEntityTagRecord, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
-
+    port_sheet_regions: tuple[PortSheetRegionRecord, ...] = ()

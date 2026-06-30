@@ -17,6 +17,7 @@ from semantic_geometry_builder.models.common import (
     PolygonRing,
     RouteLiteral,
 )
+from semantic_geometry_builder.models.regions import PortSheetRegionRecord
 
 
 @dataclass(frozen=True)
@@ -59,10 +60,15 @@ class SemanticEntitySpec:
 
 @dataclass(frozen=True)
 class GeometryBuildInput:
-    """Adapter boundary for route-aware semantic geometry construction."""
+    """Adapter boundary for route-aware semantic geometry construction.
+
+    `port_sheet_regions` are pre-planning 2D region-layer records for Palace
+    lumped-port sheets. They are not backend topology and must not become live
+    surfaces without an explicit local-fragment lowering step.
+    """
 
     polygons: tuple[LayoutPolygonSpec, ...]
     entities: tuple[SemanticEntitySpec, ...]
     solution_regions: Mapping[str, Any] = field(default_factory=dict)
     metadata: Mapping[str, Any] = field(default_factory=dict)
-
+    port_sheet_regions: tuple[PortSheetRegionRecord, ...] = ()

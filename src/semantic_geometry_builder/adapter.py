@@ -13,6 +13,8 @@ from semantic_geometry_builder.models import (
     GeometryBuildInput,
     LayoutPolygonSpec,
     PathInput,
+    PortSheetOverlapRecord,
+    PortSheetRegionRecord,
     SemanticEntitySpec,
 )
 
@@ -69,6 +71,9 @@ def build_gds_stack_geometry_input(
       `AIR` or `substrate`, to metadata. Each region may define `material_id`,
       `priority`, `geometry_kind`, and `geometry`; missing values default to
       the semantic id, `0`, `domain`, and the metadata mapping itself.
+    - `metadata.port_sheet_source_layers`: optional sequence of Palace
+      lumped-port sheet source layers. These become `PortSheetRegionRecord`s,
+      not backend-live `SurfacePlanRecord`s.
     - `metadata`: optional mapping copied into `GeometryBuildInput.metadata`.
 
     `metadata` is copied to `GeometryBuildInput.metadata` for adapter version,
@@ -150,10 +155,17 @@ def build_gds_stack_geometry_input(
         entities,
         polygons,
     )
+    port_sheet_regions = _port_sheet_regions_from_stack_metadata(
+        stack_metadata,
+        polygons_by_layer=polygons_by_layer,
+        host_entities=entities,
+        host_polygons=polygons,
+    )
 
     return GeometryBuildInput(
         polygons=tuple(polygons),
         entities=tuple(entities),
+        port_sheet_regions=port_sheet_regions,
         solution_regions=dict(solution_regions),
         metadata=combined_metadata,
     )
@@ -875,6 +887,145 @@ def _entity_with_polygon_geometry(
         geometry=geometry,
         metadata=entity.metadata,
     )
+
+
+def _port_sheet_regions_from_stack_metadata(
+    stack_metadata: Mapping[str, Any],
+    *,
+    polygons_by_layer: Mapping[tuple[int, int], tuple[Any, ...]],
+    host_entities: Sequence[SemanticEntitySpec],
+    host_polygons: Sequence[LayoutPolygonSpec],
+) -> tuple[PortSheetRegionRecord, ...]:
+    records = stack_metadata.get("port_sheet_source_layers", ())
+    if records is None:
+        return ()
+    if not _is_record_sequence(records):
+        raise TypeError("metadata.port_sheet_source_layers must be a sequence")
+
+    host_entity_by_polygon_id = {
+        polygon_id: entity
+        for entity in host_entities
+        for polygon_id in entity.polygon_ids
+    }
+    host_polygons_by_id = {polygon.polygon_id: polygon for polygon in host_polygons}
+    port_regions: list[PortSheetRegionRecord] = []
+    for source_index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            raise TypeError("metadata.port_sheet_source_layers items must be mappings")
+        if record.get("source") != "palace_lumped_port_sheet":
+            raise ValueError(
+                "port_sheet_source_layers currently supports only "
+                "source='palace_lumped_port_sheet'"
+            )
+        if "layer" not in record or "datatype" not in record:
+            raise ValueError(
+                "metadata.port_sheet_source_layers entries must define "
+                "'layer' and 'datatype'"
+            )
+        layer = int(record["layer"])
+        datatype = int(record["datatype"])
+        source_polygons = polygons_by_layer.get((layer, datatype), ())
+        if not source_polygons:
+            raise ValueError(
+                f"port_sheet_source_layers entry {layer}/{datatype} has no polygons"
+            )
+        for polygon_index, polygon in enumerate(source_polygons):
+            source_polygon = LayoutPolygonSpec(
+                polygon_id=f"PORT_SHEET_{layer}_{datatype}__P{polygon_index:04d}",
+                layer=f"{layer}/{datatype}",
+                exterior=_ring_from_gdstk_polygon(polygon),
+                metadata={
+                    "gds_layer": layer,
+                    "gds_datatype": datatype,
+                    "source": "palace_lumped_port_sheet",
+                    "source_name": record.get("name"),
+                },
+            )
+            port_sheet_id = (
+                f"PORT_SHEET__{record.get('name') or f'{layer}_{datatype}'}"
+                f"__{polygon_index:04d}"
+            )
+            overlaps = _port_sheet_overlaps(
+                port_sheet_id=port_sheet_id,
+                port_polygon=source_polygon,
+                host_entity_by_polygon_id=host_entity_by_polygon_id,
+                host_polygons_by_id=host_polygons_by_id,
+            )
+            port_regions.append(
+                PortSheetRegionRecord(
+                    port_sheet_id=port_sheet_id,
+                    source_layer=f"{layer}/{datatype}",
+                    source_polygon_id=source_polygon.polygon_id,
+                    exterior=source_polygon.exterior,
+                    holes=source_polygon.holes,
+                    overlaps=overlaps,
+                    metadata={
+                        "source_index": source_index,
+                        "source_name": record.get("name"),
+                        "source": "palace_lumped_port_sheet",
+                    },
+                )
+            )
+    return tuple(port_regions)
+
+
+def _port_sheet_overlaps(
+    *,
+    port_sheet_id: str,
+    port_polygon: LayoutPolygonSpec,
+    host_entity_by_polygon_id: Mapping[str, SemanticEntitySpec],
+    host_polygons_by_id: Mapping[str, LayoutPolygonSpec],
+) -> tuple[PortSheetOverlapRecord, ...]:
+    import gdstk
+
+    port_region = _layout_polygon_region(gdstk, port_polygon)
+    overlaps: list[PortSheetOverlapRecord] = []
+    for host_polygon_id, host_polygon in host_polygons_by_id.items():
+        host_entity = host_entity_by_polygon_id.get(host_polygon_id)
+        if host_entity is None or not _is_port_sheet_host_entity(host_entity):
+            continue
+        overlap_region = gdstk.boolean(
+            port_region,
+            _layout_polygon_region(gdstk, host_polygon),
+            "and",
+            precision=1e-9,
+        )
+        for index, overlap_polygon in enumerate(overlap_region or ()):
+            if abs(float(overlap_polygon.area())) <= 1e-8:
+                continue
+            overlaps.append(
+                PortSheetOverlapRecord(
+                    overlap_id=(
+                        f"PORT_SHEET_OVERLAP__{port_sheet_id}__"
+                        f"{host_entity.semantic_id}__{len(overlaps):04d}"
+                    ),
+                    port_sheet_id=port_sheet_id,
+                    port_polygon_id=port_polygon.polygon_id,
+                    host_semantic_id=host_entity.semantic_id,
+                    host_polygon_id=host_polygon_id,
+                    overlap_loop=_ring_from_gdstk_polygon(overlap_polygon),
+                    metadata={"overlap_polygon_index": index},
+                )
+            )
+    return tuple(overlaps)
+
+
+def _is_port_sheet_host_entity(entity: SemanticEntitySpec) -> bool:
+    role_tokens = set(str(entity.role).lower().replace("_", " ").split())
+    if role_tokens & {"solution", "source", "mask", "ignored"}:
+        return False
+    if not entity.polygon_ids:
+        return False
+    geometry_source = str(entity.geometry.get("geometry_source", "gds_polygon"))
+    return geometry_source in {"gds_polygon", "die_face_minus_ground_mask"}
+
+
+def _layout_polygon_region(gdstk: Any, polygon: LayoutPolygonSpec) -> tuple[Any, ...]:
+    outer = gdstk.Polygon(polygon.exterior)
+    holes = tuple(gdstk.Polygon(hole) for hole in polygon.holes)
+    if not holes:
+        return (outer,)
+    return tuple(gdstk.boolean((outer,), holes, "not", precision=1e-9) or ())
 
 
 def _route_a_sheet_interfaces(

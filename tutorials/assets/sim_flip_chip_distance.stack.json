@@ -10,7 +10,17 @@
       "D0_TOP_M1 draw polygons are selector-point assigned as Unassigned until semantic naming is reviewed.",
       "High-count indium bump arrays are split into per-polygon semantic bump bodies so contact patches can be planned explicitly.",
       "Under-bump metal is deliberately ignored because it does not enter the simulation pipeline.",
-      "Layer 202/1 is a Palace lumped-port sheet source layer; it is ignored until v1 has an explicit port-sheet plan."
+      "Layer 202/1 is a Palace lumped-port sheet source layer carried as a region-layer record, not as backend-live surface geometry."
+    ],
+    "port_sheet_source_layers": [
+      {
+        "layer": 202,
+        "datatype": 1,
+        "name": "D0_TOP_SIM_BOUNDARY",
+        "source": "palace_lumped_port_sheet",
+        "overlap_contract": "may_overlap_host_2d_polygons_only",
+        "lowering_status": "region_record_only_not_backend_live"
+      }
     ],
     "ignored_layout_layers": [
       {
@@ -25,19 +35,13 @@
         "name": "D1_BOTTOM_M1_ETCH",
         "reason": "etch/source mask only; ground plane uses D1_BOTTOM_GROUND_MASK"
       },
-    {
-      "layer": 202,
-      "datatype": 1,
-      "name": "D0_TOP_SIM_BOUNDARY",
-      "reason": "Palace lumped-port sheet source layer; ignored until v1 has an explicit port-sheet plan"
-    },
-    {
-      "layer": 40,
-      "datatype": 1,
-      "name": "D0_D1_UNDER_BUMP",
-      "reason": "under-bump metal is not simulated"
-    }
-  ]
+      {
+        "layer": 40,
+        "datatype": 1,
+        "name": "D0_D1_UNDER_BUMP",
+        "reason": "under-bump metal is not simulated"
+      }
+    ]
   },
   "solution_regions": {
     "D0_To_D1_Air": {

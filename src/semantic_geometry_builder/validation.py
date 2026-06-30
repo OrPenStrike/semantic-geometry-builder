@@ -37,6 +37,7 @@ _INTERFACE_KINDS = {"MM", "SS", "AA", "MS", "MA", "SA"}
 # gdstk booleans can leave tiny numerical slivers at curved mask boundaries;
 # topology-significant overlaps are orders of magnitude larger than this.
 _BOOLEAN_AREA_EPS_UM2 = 1e-8
+_BOOLEAN_RELATIVE_AREA_EPS = 1e-12
 
 
 def validate_geometry_input(build_input: GeometryBuildInput) -> GeometryBuildInput:
@@ -44,6 +45,7 @@ def validate_geometry_input(build_input: GeometryBuildInput) -> GeometryBuildInp
     errors: list[str] = []
     polygon_ids: set[str] = set()
     entity_ids: set[str] = set()
+    entities_by_id: dict[str, SemanticEntitySpec] = {}
 
     for polygon in build_input.polygons:
         if not polygon.polygon_id:
@@ -62,11 +64,73 @@ def validate_geometry_input(build_input: GeometryBuildInput) -> GeometryBuildInp
         entity_ids.add(entity.semantic_id)
         if not entity.material_id:
             errors.append(f"{entity.semantic_id} material_id must be non-empty")
+        entities_by_id[entity.semantic_id] = entity
         for polygon_id in entity.polygon_ids:
             if polygon_id not in polygon_ids:
                 errors.append(
                     f"{entity.semantic_id} references unknown polygon_id: {polygon_id}"
                 )
+
+    port_sheet_ids: set[str] = set()
+    for region in build_input.port_sheet_regions:
+        if not region.port_sheet_id:
+            errors.append("port_sheet_id must be non-empty")
+        elif region.port_sheet_id in port_sheet_ids:
+            errors.append(f"duplicate port_sheet_id: {region.port_sheet_id}")
+        port_sheet_ids.add(region.port_sheet_id)
+        if region.metadata.get("source") != "palace_lumped_port_sheet":
+            errors.append(
+                f"{region.port_sheet_id} must declare source "
+                "'palace_lumped_port_sheet'"
+            )
+        if len(region.exterior) < 3:
+            errors.append(f"{region.port_sheet_id} exterior requires 3 points")
+        for overlap in region.overlaps:
+            if overlap.port_polygon_id != region.source_polygon_id:
+                errors.append(
+                    f"{overlap.overlap_id} port polygon "
+                    f"{overlap.port_polygon_id!r} does not match region source "
+                    f"{region.source_polygon_id!r}"
+                )
+            if overlap.operation != "local_fragment_required":
+                errors.append(
+                    f"{overlap.overlap_id} unsupported port-sheet operation "
+                    f"{overlap.operation!r}"
+                )
+            if overlap.port_sheet_id != region.port_sheet_id:
+                errors.append(
+                    f"{overlap.overlap_id} references port sheet "
+                    f"{overlap.port_sheet_id!r}, expected {region.port_sheet_id!r}"
+                )
+            if overlap.host_semantic_id not in entity_ids:
+                errors.append(
+                    f"{overlap.overlap_id} references unknown host semantic id "
+                    f"{overlap.host_semantic_id}"
+                )
+            else:
+                host_entity = entities_by_id[overlap.host_semantic_id]
+                host_is_solver_geometry = (
+                    not _is_solution_entity(host_entity)
+                    and _requires_route_representation(host_entity)
+                )
+                if not host_is_solver_geometry:
+                    errors.append(
+                        f"{overlap.overlap_id} host {overlap.host_semantic_id} "
+                        "is not solver-relevant geometry"
+                    )
+                if overlap.host_polygon_id not in host_entity.polygon_ids:
+                    errors.append(
+                        f"{overlap.overlap_id} host polygon "
+                        f"{overlap.host_polygon_id} is not owned by "
+                        f"{overlap.host_semantic_id}"
+                    )
+            if overlap.host_polygon_id not in polygon_ids:
+                errors.append(
+                    f"{overlap.overlap_id} references unknown host polygon id "
+                    f"{overlap.host_polygon_id}"
+                )
+            if len(overlap.overlap_loop) < 3:
+                errors.append(f"{overlap.overlap_id} overlap_loop requires 3 points")
 
     if not any(_is_air_like_solution_entity(entity) for entity in build_input.entities):
         errors.append("GeometryBuildInput requires an air/vacuum solution entity")
@@ -830,7 +894,16 @@ def _regions_overlap(left: tuple[Any, ...], right: tuple[Any, ...]) -> bool:
     import gdstk
 
     overlap = gdstk.boolean(left, right, "and", precision=1e-9) or ()
-    return any(abs(polygon.area()) > _BOOLEAN_AREA_EPS_UM2 for polygon in overlap)
+    overlap_area = _region_area(overlap)
+    area_limit = max(
+        _BOOLEAN_AREA_EPS_UM2,
+        _BOOLEAN_RELATIVE_AREA_EPS * min(_region_area(left), _region_area(right)),
+    )
+    return overlap_area > area_limit
+
+
+def _region_area(region: tuple[Any, ...]) -> float:
+    return sum(abs(float(polygon.area())) for polygon in region)
 
 
 def _known_hole_signatures(

@@ -44,6 +44,10 @@ from semantic_geometry_builder.models.input import (
     LayoutPolygonSpec,
     SemanticEntitySpec,
 )
+from semantic_geometry_builder.models.regions import (
+    PortSheetOverlapRecord,
+    PortSheetRegionRecord,
+)
 from semantic_geometry_builder.models.tags import (
     BackendEntityTagRecord,
     FinalPhysicalGroupRecord,
@@ -90,6 +94,8 @@ __all__ = [
     "PathInput",
     "PointPlanRecord",
     "PolygonRing",
+    "PortSheetOverlapRecord",
+    "PortSheetRegionRecord",
     "RouteLiteral",
     "SemanticEntitySpec",
     "SolverUseLiteral",

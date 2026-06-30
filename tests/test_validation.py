@@ -5,6 +5,10 @@ from semantic_geometry_builder.models import (
     SurfaceLoopRecord,
     SurfacePlanRecord,
 )
+from semantic_geometry_builder.planning import (
+    _geometry_ref_from_gdstk_polygon,
+    plan_canonical_topology,
+)
 from semantic_geometry_builder.validation import (
     validate_curve_plan_coverage,
     validate_no_surface_overlap,
@@ -211,9 +215,184 @@ def test_no_surface_overlap_rejects_real_overlap() -> None:
     raise AssertionError("validate_no_surface_overlap did not fail")
 
 
+def test_no_surface_overlap_ignores_tiny_relative_sliver() -> None:
+    first = SurfacePlanRecord(
+        surface_id="first",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={
+            "plane": {"axis": "z", "value_um": 0.0},
+            "outer_loop": (
+                (0.0, 0.0),
+                (10000.0, 0.0),
+                (10000.0, 10000.0),
+                (0.0, 10000.0),
+            ),
+        },
+    )
+    second = SurfacePlanRecord(
+        surface_id="second",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={
+            "plane": {"axis": "z", "value_um": 0.0},
+            "outer_loop": (
+                (10000.0 - 1e-9, 0.0),
+                (20000.0, 0.0),
+                (20000.0, 10000.0),
+                (10000.0 - 1e-9, 10000.0),
+            ),
+        },
+    )
+    validate_no_surface_overlap(surfaces=(first, second))
+
+
+def test_no_surface_overlap_rejects_overlap_above_relative_sliver_limit() -> None:
+    first = SurfacePlanRecord(
+        surface_id="first",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={
+            "plane": {"axis": "z", "value_um": 0.0},
+            "outer_loop": (
+                (0.0, 0.0),
+                (10000.0, 0.0),
+                (10000.0, 10000.0),
+                (0.0, 10000.0),
+            ),
+        },
+    )
+    second = SurfacePlanRecord(
+        surface_id="second",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={
+            "plane": {"axis": "z", "value_um": 0.0},
+            "outer_loop": (
+                (10000.0 - 2e-8, 0.0),
+                (20000.0, 0.0),
+                (20000.0, 10000.0),
+                (10000.0 - 2e-8, 10000.0),
+            ),
+        },
+    )
+    try:
+        validate_no_surface_overlap(surfaces=(first, second))
+    except ValueError as exc:
+        assert "overlaps" in str(exc)
+        return
+    raise AssertionError("validate_no_surface_overlap did not fail")
+
+
+def test_gdstk_cutline_polygon_becomes_outer_with_hole() -> None:
+    import gdstk
+
+    cutline_loop = (
+        (0.0, 1.0),
+        (1.0, 1.0),
+        (1.0, 2.0),
+        (2.0, 2.0),
+        (2.0, 1.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (0.0, 0.0),
+        (3.0, 0.0),
+        (3.0, 3.0),
+        (0.0, 3.0),
+    )
+    geometry_ref = _geometry_ref_from_gdstk_polygon({}, gdstk.Polygon(cutline_loop))
+    assert len(geometry_ref["hole_loops"]) == 1
+
+    surface = SurfacePlanRecord(
+        surface_id="cutline_surface",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={"plane": {"axis": "z", "value_um": 0.0}, **geometry_ref},
+    )
+    points, curves, loops, surfaces = plan_canonical_topology(surfaces=(surface,))
+    validate_curve_plan_coverage(
+        points=points,
+        curves=curves,
+        surface_loops=loops,
+        surfaces=surfaces,
+    )
+
+
+def test_gdstk_cutline_polygon_uses_topology_coordinate_tolerance() -> None:
+    import gdstk
+
+    cutline_loop = (
+        (0.0, 1.0),
+        (1.0, 1.0),
+        (1.0, 2.0),
+        (2.0, 2.0),
+        (2.0, 1.0),
+        (1.0 + 2e-10, 1.0),
+        (2e-10, 1.0),
+        (0.0, 0.0),
+        (3.0, 0.0),
+        (3.0, 3.0),
+        (0.0, 3.0),
+    )
+    geometry_ref = _geometry_ref_from_gdstk_polygon({}, gdstk.Polygon(cutline_loop))
+    assert len(geometry_ref["hole_loops"]) == 1
+
+    surface = SurfacePlanRecord(
+        surface_id="cutline_surface",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={"plane": {"axis": "z", "value_um": 0.0}, **geometry_ref},
+    )
+    points, curves, loops, surfaces = plan_canonical_topology(surfaces=(surface,))
+    validate_curve_plan_coverage(
+        points=points,
+        curves=curves,
+        surface_loops=loops,
+        surfaces=surfaces,
+    )
+
+
+def test_canonical_topology_drops_tiny_edges_and_collinear_points() -> None:
+    surface = SurfacePlanRecord(
+        surface_id="dirty_surface",
+        owner_semantic_id="owner",
+        surface_role="test",
+        geometry_ref={
+            "plane": {"axis": "z", "value_um": 0.0},
+            "outer_loop": (
+                (0.0, 0.0),
+                (1e-10, 0.0),
+                (1.0, 0.0),
+                (2.0, 0.0),
+                (2.0, 1.0),
+                (1.0, 1.0),
+                (0.0, 1.0),
+                (0.0, 2e-10),
+            ),
+        },
+    )
+
+    points, curves, loops, surfaces = plan_canonical_topology(surfaces=(surface,))
+
+    assert len(points) == 4
+    assert len(curves) == 4
+    assert len(loops[0].curve_refs) == 4
+    validate_curve_plan_coverage(
+        points=points,
+        curves=curves,
+        surface_loops=loops,
+        surfaces=surfaces,
+    )
+
+
 if __name__ == "__main__":
     test_valid_square_loop_passes()
     test_repeated_curve_ref_fails()
     test_self_touching_point_fails()
     test_no_surface_overlap_skips_exact_known_hole()
     test_no_surface_overlap_rejects_real_overlap()
+    test_no_surface_overlap_ignores_tiny_relative_sliver()
+    test_no_surface_overlap_rejects_overlap_above_relative_sliver_limit()
+    test_gdstk_cutline_polygon_becomes_outer_with_hole()
+    test_gdstk_cutline_polygon_uses_topology_coordinate_tolerance()
+    test_canonical_topology_drops_tiny_edges_and_collinear_points()

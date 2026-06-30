@@ -101,6 +101,14 @@ from cell adjacency before backend geometry is created. Horizontal adjacency
 creates top/bottom faces such as `MS`, `MA`, or `SA`; vertical adjacency from
 shared atomic 2D edges creates sidewall faces.
 
+The only intentional 2D overlay supported in this slice is a Palace lumped-port
+sheet declared under `metadata.port_sheet_source_layers`. The adapter records
+those source polygons as `PortSheetRegionRecord`s and catches any semantic-host
+overlap as `PortSheetOverlapRecord`s. Those records are not solver-live
+surfaces; all other live surface overlap remains an error. Backend local
+fragmentation for these port sheets is still fail-fast and must be implemented
+before SGB writes a solver-ready XAO for such inputs.
+
 Inset rings are planned before OCC construction. A parent interface is only a
 logical aggregate: the planner must expand it into child ring/core
 `SurfacePlanRecord`s, disable the parent as live geometry, and only pass
@@ -209,10 +217,11 @@ Current source layers:
   writes one route XAO file; it does not discover interfaces through global
   fragment operations.
 - `src/semantic_geometry_builder/models/`: stage handoff records. `common.py`
-  owns aliases/constants, `input.py` owns adapter IR, `topology.py` owns
-  interface/surface/volume topology records, `construction.py` owns route
-  construction-plan records, and `tags.py` owns physical-group/tag ledger
-  records. `models/__init__.py` keeps the public import path stable.
+  owns aliases/constants, `input.py` owns adapter IR, `regions.py` owns 2D
+  port-sheet overlap records, `topology.py` owns interface/surface/volume
+  topology records, `construction.py` owns route construction-plan records, and
+  `tags.py` owns physical-group/tag ledger records. `models/__init__.py` keeps
+  the public import path stable.
 
 ## Run Folder Contract
 
